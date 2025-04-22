@@ -1,6 +1,6 @@
-# Gemini Annotater
+# Gemini Annotator
 
-- Gemini Annotater is a Python project that uses the Gemini API to annotate images in YOLO format. The project utilizes uv for Python package management.
+- Gemini Annotator is a Python project that uses the Gemini API to annotate images in YOLO format. The project utilizes uv for Python package management.
 - This project structured to use free Gemini API with rate limiting (15 RPM) and concurrent processing using a thread pool.
 - If you want to use the paid Gemini API, you can set the RPM limit to a higher value to process more images concurrently.
 
