@@ -27,37 +27,37 @@ logger = logging.getLogger(__name__)
 
 # --- Constants ---
 SUPPORTED_IMAGE_FORMATS = ('.jpg', '.jpeg', '.png', '.bmp', '.webp')
-DEFAULT_GEMINI_MODEL = "gemini-1.5-flash"
+DEFAULT_GEMINI_MODEL = "gemini-2.0-flash"
 DEFAULT_MAX_WORKERS = 4
 RETRY_ATTEMPTS = 3
 RETRY_WAIT_MULTIPLIER = 10
 RETRY_WAIT_MAX = 40
-API_RPM_LIMIT = 15 # <-- Dakikadaki istek limiti
-API_REQUEST_PERIOD = 60 # saniye (1 dakika)
+API_RPM_LIMIT = 15 # <-- Requests per minute limit
+API_REQUEST_PERIOD = 60 # seconds (1 minute)
 
 RETRYABLE_EXCEPTIONS = (
-    genai_errors.ServerError,           # 5xx hataları
+    genai_errors.ServerError,
     genai_errors.ClientError,
-    TimeoutError,                       # Genel zaman aşımı
-    genai_errors.APIError,              # 503 Service Unavailable gibi diğer API hataları
+    TimeoutError,                       # General timeout
+    genai_errors.APIError,
 )
 PYTHON_MIN_VERSION = (3, 9)
 
 # --- Helper Functions ---
 
 def check_python_version():
-    """Minimum Python sürümünü kontrol eder."""
+    """Checks the minimum required Python version."""
     import sys
     if sys.version_info < PYTHON_MIN_VERSION:
         major, minor = PYTHON_MIN_VERSION
         logger.critical(
-            f"Bu betik Python {major}.{minor} veya üzerini gerektirir. "
-            f"Mevcut sürüm: {sys.version.split()[0]}"
+            f"This script requires Python {major}.{minor} or higher. "
+            f"Current version: {sys.version.split()[0]}"
         )
         sys.exit(1)
 
 def get_mime_type(filename: str) -> str:
-    """Dosya adından MIME türünü tahmin eder."""
+    """Guesses the MIME type from the filename."""
     mime_type, _ = mimetypes.guess_type(filename)
     if mime_type and mime_type.startswith("image/"):
         return mime_type
@@ -70,45 +70,45 @@ def get_mime_type(filename: str) -> str:
         return 'image/webp'
     elif ext == '.bmp':
         return 'image/bmp'
-    logger.warning(f"MIME türü tahmin edilemedi: {filename}. 'application/octet-stream' kullanılıyor.")
+    logger.warning(f"Could not guess MIME type for: {filename}. Using 'application/octet-stream'.")
     return 'application/octet-stream'
 
 def get_image_dimensions(image_path: str) -> Optional[Tuple[int, int]]:
-    """Verilen görüntünün genişlik ve yüksekliğini döndürür."""
+    """Returns the width and height of the given image."""
     try:
         with Image.open(image_path) as img:
-            img.verify()
+            img.verify() # Verify headers without loading full image data
         with Image.open(image_path) as img:
             return img.width, img.height
     except FileNotFoundError:
-        logger.error(f"Görüntü bulunamadı: {image_path}")
+        logger.error(f"Image not found: {image_path}")
         return None
     except (IOError, SyntaxError, Image.UnidentifiedImageError) as e:
-         logger.error(f"Görüntü dosyası okunamadı veya bozuk ({image_path}): {e}")
+         logger.error(f"Could not read or invalid image file ({image_path}): {e}")
          return None
     except Exception as e:
-        logger.error(f"Görüntü boyutları alınırken hata ({image_path}): {e}", exc_info=True)
+        logger.error(f"Error getting image dimensions ({image_path}): {e}", exc_info=True)
         return None
 
 def load_class_list(filepath: str) -> List[str]:
-    """Verilen dosyadan sınıf listesini okur (her satır bir sınıf)."""
+    """Reads the class list from the given file (one class per line)."""
     try:
         with open(filepath, 'r', encoding='utf-8') as f:
             classes = [line.strip() for line in f if line.strip()]
         if not classes:
-            logger.error(f"Sınıf listesi dosyası ({filepath}) boş veya geçerli sınıf içermiyor.")
-            raise ValueError("Sınıf listesi boş.")
-        logger.info(f"{len(classes)} sınıf yüklendi: {', '.join(classes)}")
+            logger.error(f"Class list file ({filepath}) is empty or contains no valid classes.")
+            raise ValueError("Class list is empty.")
+        logger.info(f"{len(classes)} classes loaded: {', '.join(classes)}")
         return classes
     except FileNotFoundError:
-        logger.error(f"Sınıf listesi dosyası bulunamadı: {filepath}")
+        logger.error(f"Class list file not found: {filepath}")
         raise
     except Exception as e:
-        logger.error(f"Sınıf listesi dosyası okunurken hata ({filepath}): {e}", exc_info=True)
+        logger.error(f"Error reading class list file ({filepath}): {e}", exc_info=True)
         raise
 
 def create_class_mapping(class_list: List[str]) -> Dict[str, int]:
-    """Sınıf listesinden sınıf adı -> sınıf ID eşlemesi oluşturur."""
+    """Creates a class name -> class ID mapping from the class list."""
     return {class_name.lower(): i for i, class_name in enumerate(class_list)}
 
 def convert_gemini_to_yolo(
@@ -116,39 +116,40 @@ def convert_gemini_to_yolo(
     class_mapping: Dict[str, int],
     image_width: int,
     image_height: int,
-    image_path: str # Logging için
+    image_path: str # For logging
 ) -> List[str]:
     """
-    Gemini API'sinden alınan etiketleri YOLO formatına dönüştürür.
-    Gemini'nin [ymin, xmin, ymax, xmax] (0-1000 normalleştirilmiş) formatını bekler.
+    Converts annotations received from the Gemini API to YOLO format.
+    Expects Gemini's [ymin, xmin, ymax, xmax] (normalized 0-1000) format.
     """
     yolo_annotations = []
     if not isinstance(gemini_annotations, list):
-         logger.warning(f"Beklenmeyen Gemini çıktı formatı (liste değil): {gemini_annotations} - Görüntü: {image_path}")
+         logger.warning(f"Unexpected Gemini output format (not a list): {gemini_annotations} - Image: {image_path}")
          return []
 
     for ann_index, annotation in enumerate(gemini_annotations):
         if not isinstance(annotation, dict):
-            logger.warning(f"Beklenmeyen annotation formatı (sözlük değil): {annotation} at index {ann_index} - Görüntü: {image_path}")
+            logger.warning(f"Unexpected annotation format (not a dictionary): {annotation} at index {ann_index} - Image: {image_path}")
             continue
 
         try:
+            # Case-insensitive key matching
             box_key = next((k for k in annotation if k.lower() == "box_2d"), None)
             label_key = next((k for k in annotation if k.lower() == "label"), None)
 
             if not box_key or not label_key:
-                logger.warning(f"Eksik 'box_2d' veya 'label' anahtarı: {annotation} - Görüntü: {image_path}")
+                logger.warning(f"Missing 'box_2d' or 'label' key: {annotation} - Image: {image_path}")
                 continue
 
             box = annotation[box_key]
-            label = str(annotation[label_key]).lower()
+            label = str(annotation[label_key]).lower() # Convert label to lower case for mapping
 
             if not isinstance(box, list) or len(box) != 4:
-                logger.warning(f"Geçersiz 'box_2d' formatı: {box} - Görüntü: {image_path}")
+                logger.warning(f"Invalid 'box_2d' format: {box} - Image: {image_path}")
                 continue
 
             if label not in class_mapping:
-                logger.debug(f"'{label}' sınıfı sınıf eşlemesinde bulunamadı. Atlama yapılıyor. Görüntü: {image_path}")
+                logger.debug(f"Class '{label}' not found in class mapping. Skipping. Image: {image_path}")
                 continue
 
             class_id = class_mapping[label]
@@ -156,18 +157,21 @@ def convert_gemini_to_yolo(
             try:
                 ymin, xmin, ymax, xmax = map(float, box)
             except (ValueError, TypeError) as e:
-                logger.warning(f"Geçersiz koordinat değeri: {box} ({e}) - Görüntü: {image_path}")
+                logger.warning(f"Invalid coordinate value: {box} ({e}) - Image: {image_path}")
                 continue
 
+            # Validate coordinates are within 0-1000 and logical (min < max)
             if not (0 <= ymin <= 1000 and 0 <= xmin <= 1000 and 0 <= ymax <= 1000 and 0 <= xmax <= 1000 and xmin < xmax and ymin < ymax):
-                 logger.warning(f"Geçersiz veya sıra dışı koordinat değerleri (0-1000 aralığı dışında veya min>=max): {box} - Görüntü: {image_path}")
+                 logger.warning(f"Invalid or out-of-range coordinate values (outside 0-1000 or min>=max): {box} - Image: {image_path}")
                  continue
 
+            # Convert to YOLO format (center_x, center_y, width, height) normalized 0-1
             x_center = ((xmin + xmax) / 2) / 1000.0
             y_center = ((ymin + ymax) / 2) / 1000.0
             bbox_width = (xmax - xmin) / 1000.0
             bbox_height = (ymax - ymin) / 1000.0
 
+            # Clamp values to [0.0, 1.0] to handle potential minor floating point inaccuracies
             x_center = max(0.0, min(1.0, x_center))
             y_center = max(0.0, min(1.0, y_center))
             bbox_width = max(0.0, min(1.0, bbox_width))
@@ -177,20 +181,20 @@ def convert_gemini_to_yolo(
             yolo_annotations.append(yolo_line)
 
         except Exception as e:
-            logger.error(f"Etiket dönüştürme hatası ({annotation}): {e} - Görüntü: {image_path}", exc_info=True)
+            logger.error(f"Annotation conversion error ({annotation}): {e} - Image: {image_path}", exc_info=True)
             continue
 
     return yolo_annotations
 
-# --- Gemini API Interaction (Updated for google-genai >= 1.11.0 and Rate Limiting) ---
+# --- Gemini API Interaction ---
 
 @retry(
     stop=stop_after_attempt(RETRY_ATTEMPTS),
     wait=wait_exponential(multiplier=RETRY_WAIT_MULTIPLIER, max=RETRY_WAIT_MAX),
     retry=retry_if_exception_type(RETRYABLE_EXCEPTIONS),
     before_sleep=lambda retry_state: logger.warning(
-        f"API hatası/limit ({type(retry_state.outcome.exception()).__name__}), yeniden deneniyor... " # <-- Log mesajı güncellendi
-        f"(Deneme {retry_state.attempt_number}/{RETRY_ATTEMPTS})"
+        f"API error/limit ({type(retry_state.outcome.exception()).__name__}), retrying... " # <-- Log message updated
+        f"(Attempt {retry_state.attempt_number}/{RETRY_ATTEMPTS})"
     )
 )
 def call_gemini_api(
@@ -198,19 +202,20 @@ def call_gemini_api(
     model_name: str,
     image_path: str,
     class_list: List[str],
-    limiter: RateLimiter # <-- RateLimiter nesnesi eklendi
+    limiter: RateLimiter
 ) -> Optional[List[Dict[str, Any]]]:
-    """Gemini API'sini client.generate_content kullanarak çağırır ve rate limit uygular."""
+    """Calls the Gemini API using client.generate_content and applies rate limiting."""
     try:
-        logger.debug(f"Gemini API çağrısı hazırlanıyor: {image_path}")
+        logger.debug(f"Preparing Gemini API call: {image_path}")
         with open(image_path, "rb") as image_file:
             image_data = image_file.read()
             if not image_data:
-                logger.error(f"Görüntü dosyası boş: {image_path}")
+                logger.error(f"Image file is empty: {image_path}")
                 return None
 
         mime_type = get_mime_type(image_path)
         image_part = types.Part.from_bytes(data=image_data, mime_type=mime_type)
+
 
         prompt = f"""
         Analyze the provided image and identify all objects belonging to the following classes: {', '.join(class_list)}.
@@ -221,7 +226,7 @@ def call_gemini_api(
 
         Example for a single object:
         [
-          {{"label": "kedi", "box_2d": [150, 200, 750, 800]}}
+          {{"label": "cat", "box_2d": [150, 200, 750, 800]}}
         ]
         If no objects from the list are found, return an empty JSON list: [].
         Provide ONLY the JSON list in your response, without any introductory text, explanations, or markdown formatting like ```json ... ```.
@@ -230,86 +235,103 @@ def call_gemini_api(
         contents = [image_part, text_part]
 
         generation_config = types.GenerateContentConfig(
-            temperature=0.2,
-            response_mime_type='application/json',
+            temperature=0.2, # Lower temperature for more deterministic output
+            response_mime_type='application/json', # Request JSON output directly
         )
 
         # --- Rate Limiting ---
-        logger.debug(f"Rate limiter bekleniyor (limit: {limiter.max_calls}/{limiter.period}s)... {image_path}")
-        with limiter: # <-- Rate limiter burada devreye giriyor
-            logger.debug(f"Rate limiter geçildi, API çağrılıyor... {image_path}")
-            # API çağrısı
-            response = client.models.generate_content(
+        logger.debug(f"Waiting for rate limiter (limit: {limiter.max_calls}/{limiter.period}s)... {image_path}")
+        with limiter: # <-- Rate limiter engages here
+            logger.debug(f"Rate limiter passed, calling API... {image_path}")
+            # API call
+            response = client.models.generate_content( # Use the standard client method
                 model=f'models/{model_name}',
                 contents=contents,
-                config=generation_config
-                # request_options={"timeout": 60} # İsteğe bağlı zaman aşımı
+                config=generation_config # Pass config here
+                # request_options={"timeout": 60} # Optional timeout
             )
-            logger.debug(f"API çağrısı tamamlandı. {image_path}")
+            logger.debug(f"API call completed. {image_path}")
         # --- /Rate Limiting ---
 
 
         if not response.candidates:
-             logger.warning(f"Gemini'den geçerli aday yanıt alınamadı. Görüntü: {image_path}. Sebep: {response.prompt_feedback}")
-             return None
+             logger.warning(f"No valid candidate response received from Gemini. Image: {image_path}. Reason: {response.prompt_feedback}")
+             # Consider specific handling for block reasons if needed
+             # if response.prompt_feedback.block_reason == ...
+             return None # Treat as failure if no candidates
 
         candidate = response.candidates[0]
 
+        # Check finish reason for potential issues
         if candidate.finish_reason != types.FinishReason.STOP:
-             logger.warning(f"Gemini yanıtı beklenmedik şekilde sonlandı. Sebep: {candidate.finish_reason.name}. Görüntü: {image_path}")
+             logger.warning(f"Gemini response finished unexpectedly. Reason: {candidate.finish_reason.name}. Image: {image_path}")
              if candidate.finish_reason == types.FinishReason.SAFETY:
-                  logger.error(f"Yanıt güvenlik nedeniyle engellendi. Görüntü: {image_path}. Güvenlik Derecelendirmeleri: {candidate.safety_ratings}")
-             # ResourceExhausted (429) hatası da FINISH_REASON_OTHER olarak gelebilir, tenacity zaten handle edecek
+                  logger.error(f"Response blocked due to safety reasons. Image: {image_path}. Safety Ratings: {candidate.safety_ratings}")
+             # ResourceExhausted (429) error might also come as FINISH_REASON_OTHER, tenacity will handle it
              elif candidate.finish_reason == types.FinishReason.RECITATION:
-                  logger.warning(f"Yanıt alıntı nedeniyle engellendi. Görüntü: {image_path}")
+                  logger.warning(f"Response blocked due to recitation. Image: {image_path}")
              elif candidate.finish_reason == types.FinishReason.OTHER:
-                  logger.warning(f"Yanıt 'OTHER' nedeniyle sonlandı (API limiti veya başka bir sorun olabilir). Görüntü: {image_path}")
-             return None # Hata olarak işaretle
+                  logger.warning(f"Response finished due to 'OTHER' (could be API limit or another issue). Image: {image_path}")
+             # Any non-STOP finish reason is treated as a failure for this annotation task
+             return None # Mark as error
 
+        # Validate content exists
         if not candidate.content or not candidate.content.parts:
-             logger.warning(f"Gemini yanıtında içerik veya bölüm bulunamadı. Görüntü: {image_path}")
-             return []
+             logger.warning(f"Content or parts not found in Gemini response. Image: {image_path}")
+             # If the model correctly returns nothing (empty list), it should still have content/parts
+             # An empty response here likely indicates an issue.
+             return [] # Return empty list, assuming no objects found, but log warning
 
+        # Extract text, assuming the first part contains the JSON
         raw_text = candidate.content.parts[0].text.strip()
 
-        # ```json ... ``` temizleme
+        # Clean potential markdown formatting ```json ... ```
         if raw_text.startswith("```json"):
             raw_text = raw_text[len("```json"):].strip()
         elif raw_text.startswith("```"):
-             raw_text = raw_text[len("```"):].strip()
+             raw_text = raw_text[len("```"):].strip() # Handle ``` without json tag
         if raw_text.endswith("```"):
             raw_text = raw_text[:-len("```")].strip()
 
+        # Handle empty string after cleaning (could mean no objects found)
         if not raw_text:
-             logger.info(f"Gemini'den boş metin yanıtı alındı (temizleme sonrası). Görüntü: {image_path}")
+             logger.info(f"Received empty text response from Gemini (after cleaning). Assuming no objects found. Image: {image_path}")
              return []
 
         logger.debug(f"Gemini Raw Text Response ({image_path}): {raw_text}")
 
+        # Parse the JSON response
         try:
             annotations = json.loads(raw_text)
+            # Ensure the result is a list as requested in the prompt
             if not isinstance(annotations, list):
-                logger.warning(f"Gemini'den JSON listesi bekleniyordu ama farklı bir yapı alındı: {type(annotations)} - Görüntü: {image_path}")
+                logger.warning(f"Expected JSON list from Gemini but received a different structure: {type(annotations)} - Image: {image_path}")
+                # Attempt to handle if a single object dict was returned instead of a list
                 if isinstance(annotations, dict) and "label" in annotations and "box_2d" in annotations:
-                     logger.info(f"Tek nesne JSON'u listeye dönüştürülüyor. - Görüntü: {image_path}")
+                     logger.info(f"Converting single object JSON to list. - Image: {image_path}")
                      return [annotations]
+                # If it's neither a list nor a single valid object dict, treat as error
                 return None
             return annotations
         except json.JSONDecodeError as e:
-            logger.error(f"Gemini yanıtı JSON olarak ayrıştırılamadı. Yanıt: '{raw_text}'. Hata: {e} - Görüntü: {image_path}")
-            return None
+            logger.error(f"Could not parse Gemini response as JSON. Response: '{raw_text}'. Error: {e} - Image: {image_path}")
+            return None # Treat JSON parsing error as failure
 
+    # Handle specific API errors for retrying
     except genai_errors.APIError as e:
-        logger.error(f"Gemini API Hatası ({type(e).__name__}) ({image_path}): {e}", exc_info=False)
-        raise e
+        logger.error(f"Gemini API Error ({type(e).__name__}) ({image_path}): {e}", exc_info=False) # Log less detail for retryable errors
+        raise e # Re-raise for tenacity to catch
+    # Handle file not found before API call
     except FileNotFoundError:
-        logger.error(f"API çağrısı için görüntü bulunamadı: {image_path}")
-        return None
+        logger.error(f"Image not found for API call: {image_path}")
+        return None # Non-retryable error for this specific image
+    # Catch-all for other unexpected errors during the API call process
     except Exception as e:
-        logger.error(f"Gemini API çağrısı sırasında beklenmedik hata ({image_path}): {e}", exc_info=True)
+        logger.error(f"Unexpected error during Gemini API call ({image_path}): {e}", exc_info=True)
+        # Only re-raise if it's a type Tenacity should retry
         if not isinstance(e, RETRYABLE_EXCEPTIONS):
-             return None
-        raise e
+             return None # Treat as non-retryable failure for this image
+        raise e # Re-raise for tenacity
 
 # --- Main Processing Logic ---
 def process_image(
@@ -319,79 +341,91 @@ def process_image(
     class_mapping: Dict[str, int],
     client: genai.Client,
     model_name: str,
-    limiter: RateLimiter # <-- RateLimiter nesnesi eklendi
+    limiter: RateLimiter # <-- RateLimiter object added
 ) -> Tuple[str, bool, Optional[str]]:
-    """Tek bir görüntüyü işler: API çağrısı (rate limitli), dönüştürme, kaydetme."""
+    """Processes a single image: API call (rate-limited), conversion, saving."""
     start_time = time.monotonic()
     base_filename = os.path.basename(image_path)
-    logger.info(f"İşleniyor: {base_filename}")
+    logger.info(f"Processing: {base_filename}")
 
     dimensions = get_image_dimensions(image_path)
     if dimensions is None:
-        return image_path, False, "Görüntü boyutları alınamadı veya dosya bozuk."
+        # Error already logged in get_image_dimensions
+        return image_path, False, "Could not get image dimensions or file is corrupt."
     img_width, img_height = dimensions
 
+    gemini_annotations = None # Initialize
     try:
-        # Limiter'ı API çağrısına ilet
+        # Pass limiter to the API call
         gemini_annotations = call_gemini_api(client, model_name, image_path, class_list, limiter)
     except RetryError as e:
-        logger.error(f"API çağrısı tüm yeniden denemelere rağmen başarısız oldu ({base_filename}): {e}")
-        gemini_annotations = None
+        # This catches errors after all retries have failed
+        logger.error(f"API call failed after all retries ({base_filename}): {e}")
+        # gemini_annotations remains None
     except Exception as e:
-         logger.error(f"API çağrısı sırasında işlenemeyen hata ({base_filename}): {e}", exc_info=True)
-         gemini_annotations = None
+         # Catch unexpected errors not handled by retry or specific exceptions in call_gemini_api
+         logger.error(f"Unhandled error during API call processing ({base_filename}): {e}", exc_info=True)
+         # gemini_annotations remains None
 
+    # If API call failed or returned None (indicating an error or blocking)
     if gemini_annotations is None:
-        return image_path, False, "Gemini API çağrısı başarısız oldu, geçersiz yanıt döndü veya engellendi."
+        return image_path, False, "Gemini API call failed, returned invalid response, or was blocked."
 
+    # Prepare output path
     annotation_filename = os.path.splitext(base_filename)[0] + ".txt"
     annotation_path = os.path.join(output_dir, annotation_filename)
 
+    # Handle case where API returned an empty list (no objects found)
     if not gemini_annotations:
-        logger.info(f"Görüntüde ({base_filename}) belirtilen sınıflardan nesne bulunamadı veya API boş döndü.")
+        logger.info(f"No objects from the specified classes found in image ({base_filename}) or API returned empty.")
         try:
             os.makedirs(output_dir, exist_ok=True)
+            # Create an empty file to indicate processing was successful but no objects were found
             with open(annotation_path, "w") as f:
                 pass
-            logger.info(f"Boş etiket dosyası oluşturuldu: {annotation_filename}")
+            logger.info(f"Empty annotation file created: {annotation_filename}")
             processing_time = time.monotonic() - start_time
-            return image_path, True, f"Nesne bulunamadı, boş dosya oluşturuldu ({processing_time:.2f}s)"
+            return image_path, True, f"No objects found, empty file created ({processing_time:.2f}s)"
         except IOError as e:
-            logger.error(f"Boş etiket dosyası yazılamadı ({annotation_path}): {e}")
-            return image_path, False, "Boş etiket dosyası yazılamadı."
+            logger.error(f"Could not write empty annotation file ({annotation_path}): {e}")
+            return image_path, False, "Could not write empty annotation file."
 
+    # Convert valid Gemini annotations to YOLO format
     yolo_lines = convert_gemini_to_yolo(gemini_annotations, class_mapping, img_width, img_height, image_path)
 
+    # Handle case where conversion resulted in no valid lines (e.g., all labels unknown)
     if not yolo_lines:
-        logger.warning(f"Geçerli YOLO etiketleri oluşturulamadı (dönüştürme sonrası). Görüntü: {base_filename}")
-        # Boş dosya oluşturmak yine de mantıklı olabilir, böylece hangi dosyaların işlendiği belli olur
+        logger.warning(f"Could not generate valid YOLO annotations (post-conversion). Image: {base_filename}")
+
         try:
             os.makedirs(output_dir, exist_ok=True)
             with open(annotation_path, "w") as f:
                 pass
-            logger.info(f"Boş etiket dosyası oluşturuldu (dönüştürme sonrası nesne yok): {annotation_filename}")
+            logger.info(f"Empty annotation file created (no objects post-conversion): {annotation_filename}")
             processing_time = time.monotonic() - start_time
-            return image_path, True, f"Dönüştürme sonrası nesne yok, boş dosya ({processing_time:.2f}s)"
+            return image_path, True, f"No objects post-conversion, empty file ({processing_time:.2f}s)"
         except IOError as e:
-            logger.error(f"Boş etiket dosyası yazılamadı ({annotation_path}): {e}")
-            return image_path, False, "Boş etiket dosyası yazılamadı (dönüştürme sonrası)."
+            logger.error(f"Could not write empty annotation file ({annotation_path}): {e}")
+            return image_path, False, "Could not write empty annotation file (post-conversion)."
 
 
+    # Save the valid YOLO annotations
     try:
         os.makedirs(output_dir, exist_ok=True)
         with open(annotation_path, "w", encoding='utf-8') as f:
             for line in yolo_lines:
                 f.write(line + "\n")
         processing_time = time.monotonic() - start_time
-        logger.info(f"Etiketlendi ({len(yolo_lines)} nesne): {annotation_filename} ({processing_time:.2f}s)")
-        return image_path, True, f"{len(yolo_lines)} nesne etiketlendi ({processing_time:.2f}s)"
+        logger.info(f"Annotated ({len(yolo_lines)} objects): {annotation_filename} ({processing_time:.2f}s)")
+        return image_path, True, f"{len(yolo_lines)} objects annotated ({processing_time:.2f}s)"
 
     except IOError as e:
-        logger.error(f"Etiket dosyası yazılamadı ({annotation_path}): {e}")
-        return image_path, False, "Etiket dosyası yazılamadı."
+        logger.error(f"Could not write annotation file ({annotation_path}): {e}")
+        return image_path, False, "Could not write annotation file."
     except Exception as e:
-        logger.error(f"Etiket dosyası kaydedilirken beklenmedik hata ({annotation_path}): {e}", exc_info=True)
-        return image_path, False, "Etiket dosyası kaydedilirken hata oluştu."
+        # Catch any other unexpected error during file writing
+        logger.error(f"Unexpected error while saving annotation file ({annotation_path}): {e}", exc_info=True)
+        return image_path, False, "Error occurred while saving annotation file."
 
 
 def process_dataset(
@@ -401,17 +435,17 @@ def process_dataset(
     api_key: str,
     model_name: str,
     max_workers: int,
-    rpm_limit: int = API_RPM_LIMIT # <-- RPM limiti parametre olarak eklendi
+    rpm_limit: int = API_RPM_LIMIT # <-- RPM limit added as parameter
 ):
-    """Veri setindeki tüm görüntüleri paralel olarak işler (rate limitli)."""
-    logger.info(f"Veri seti işleme başlatıldı: {image_dir}")
-    logger.info(f"Çıktı klasörü: {output_dir}")
-    logger.info(f"Kullanılacak model: {model_name}")
-    logger.info(f"Maksimum işçi sayısı: {max_workers}")
-    logger.info(f"API İstek Limiti: {rpm_limit} RPM") # <-- Log eklendi
+    """Processes all images in the dataset in parallel (rate-limited)."""
+    logger.info(f"Dataset processing started: {image_dir}")
+    logger.info(f"Output directory: {output_dir}")
+    logger.info(f"Model to use: {model_name}")
+    logger.info(f"Maximum workers: {max_workers}")
+    logger.info(f"API Request Limit: {rpm_limit} RPM") # <-- Log added
 
     if not os.path.isdir(image_dir):
-        logger.error(f"Görüntü klasörü bulunamadı veya bir dizin değil: {image_dir}")
+        logger.error(f"Image directory not found or is not a directory: {image_dir}")
         return
 
     os.makedirs(output_dir, exist_ok=True)
@@ -420,23 +454,25 @@ def process_dataset(
         class_list = load_class_list(class_list_path)
         class_mapping = create_class_mapping(class_list)
     except Exception:
-        logger.error("Sınıf listesi yüklenemedi, işlem durduruluyor.")
+        # Error logged in load_class_list
+        logger.error("Could not load class list, stopping process.")
         return
 
     try:
         client = genai.Client(api_key=api_key)
-        logger.info("Gemini Client başarıyla oluşturuldu.")
+        logger.info(f"Gemini Client/Model ({model_name}) configured successfully.")
     except Exception as e:
-        logger.error(f"Gemini Client oluşturulamadı: {e}", exc_info=True)
+        logger.error(f"Could not configure Gemini Client/Model: {e}", exc_info=True)
         return
 
-    # --- Rate Limiter Oluşturma ---
-    # RateLimiter(max_calls, period) saniyede max_calls kadar izin verir.
-    # Biz dakikada (60 saniye) rpm_limit kadar istiyoruz.
+    # --- Rate Limiter Creation ---
+    # RateLimiter(max_calls, period) allows max_calls per period seconds.
+    # We want rpm_limit per minute (60 seconds).
     limiter = RateLimiter(max_calls=rpm_limit, period=API_REQUEST_PERIOD)
-    logger.info(f"Rate Limiter oluşturuldu: {rpm_limit} çağrı / {API_REQUEST_PERIOD} saniye")
-    # --- /Rate Limiter Oluşturma ---
+    logger.info(f"Rate Limiter created: {rpm_limit} calls / {API_REQUEST_PERIOD} seconds")
+    # --- /Rate Limiter Creation ---
 
+    # Find all supported image files
     image_files = [
         os.path.join(image_dir, f)
         for f in os.listdir(image_dir)
@@ -444,85 +480,97 @@ def process_dataset(
     ]
 
     if not image_files:
-        logger.warning(f"Görüntü klasöründe ({image_dir}) desteklenen formatta hiç görüntü bulunamadı.")
+        logger.warning(f"No supported image formats found in the image directory ({image_dir}).")
         return
 
-    logger.info(f"Toplam {len(image_files)} görüntü işlenecek.")
+    logger.info(f"Total {len(image_files)} images to process.")
 
     processed_count = 0
     success_count = 0
     failed_count = 0
     start_time_total = time.monotonic()
 
+    # Use ThreadPoolExecutor for parallel processing
     with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix='Annotator') as executor:
-        # Future'ları gönderirken limiter'ı da ilet
+        # Pass the limiter when submitting futures
         futures = {
+            # Pass the already configured client/model object
             executor.submit(process_image, img_path, output_dir, class_list, class_mapping, client, model_name, limiter): img_path
             for img_path in image_files
         }
 
+        # Process results as they complete
         for future in as_completed(futures):
             img_path = futures[future]
             base_filename = os.path.basename(img_path)
             processed_count += 1
             try:
+                # Get result from the future
                 _, success, message = future.result()
                 if success:
                     success_count += 1
+                    # Optional: Log success message if needed, but can be verbose
+                    # logger.debug(f"Success: {base_filename} - {message}")
                 else:
                     failed_count += 1
-                    logger.warning(f"Başarısız: {base_filename} - Sebep: {message}")
+                    # Log failure reason clearly
+                    logger.warning(f"Failed: {base_filename} - Reason: {message}")
 
+                # Log progress periodically
                 if processed_count % 20 == 0 or processed_count == len(image_files):
                      elapsed_time = time.monotonic() - start_time_total
                      rate = processed_count / elapsed_time if elapsed_time > 0 else 0
                      logger.info(
-                         f"İlerleme: {processed_count}/{len(image_files)} [{success_count}✓, {failed_count}✗] "
+                         f"Progress: {processed_count}/{len(image_files)} [{success_count}✓, {failed_count}✗] "
                          f"({elapsed_time:.1f}s, {rate:.2f} img/s)"
                      )
 
             except Exception as exc:
+                # Catch errors that might occur retrieving the result itself
                 failed_count += 1
-                logger.error(f"Görüntü işlenirken ({base_filename}) beklenmedik görev hatası: {exc}", exc_info=True)
+                logger.error(f"Unexpected task error while processing image ({base_filename}): {exc}", exc_info=True)
 
+    # Log summary after all images are processed
     end_time_total = time.monotonic()
     total_duration = end_time_total - start_time_total
     logger.info("-" * 40)
-    logger.info("İşlem Tamamlandı!")
-    logger.info(f"Toplam Görüntü: {len(image_files)}")
-    logger.info(f"Başarılı: {success_count}")
-    logger.info(f"Başarısız: {failed_count}")
-    logger.info(f"Toplam Süre: {total_duration:.2f} saniye")
-    if processed_count > 0 : logger.info(f"Ortalama Süre/Görüntü: {total_duration / processed_count:.2f} saniye")
+    logger.info("Processing Complete!")
+    logger.info(f"Total Images: {len(image_files)}")
+    logger.info(f"Successful: {success_count}")
+    logger.info(f"Failed: {failed_count}")
+    logger.info(f"Total Duration: {total_duration:.2f} seconds")
+    if processed_count > 0 : logger.info(f"Average Time/Image: {total_duration / processed_count:.2f} seconds")
     logger.info("-" * 40)
 
-# --- Argüman Ayrıştırıcı ve Ana Çalıştırma Bloğu ---
+# --- Argument Parser and Main Execution Block ---
 def main():
     check_python_version()
 
     parser = argparse.ArgumentParser(
-        description=f"Gemini API kullanarak bir görüntü veri setini YOLO formatında etiketler (google-genai >= 1.11.0, rate limitli). Python >= {PYTHON_MIN_VERSION[0]}.{PYTHON_MIN_VERSION[1]} gereklidir.",
+        description=f"Annotates an image dataset in YOLO format using the Gemini API (google-genai >= 1.11.0, rate-limited). Requires Python >= {PYTHON_MIN_VERSION[0]}.{PYTHON_MIN_VERSION[1]}.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    parser.add_argument("image_dir", help="Etiketlenecek görüntüleri içeren klasörün yolu.")
-    parser.add_argument("output_dir", help="Oluşturulacak YOLO etiket (.txt) dosyalarının kaydedileceği klasör.")
-    parser.add_argument("class_list_path", help="Her satırda bir sınıf adı içeren .txt dosyasının yolu.")
-    parser.add_argument("--api_key", help="Google Gemini API anahtarı. Belirtilmezse GOOGLE_API_KEY ortam değişkeninden okunur.", default=None)
-    parser.add_argument("--model_name", help="Kullanılacak Gemini modeli.", default=DEFAULT_GEMINI_MODEL)
-    parser.add_argument("--max_workers", type=int, help="Paralel işleme için kullanılacak maksimum işçi (thread) sayısı.", default=DEFAULT_MAX_WORKERS)
-    parser.add_argument("--rpm", type=int, help="Dakikadaki maksimum API isteği limiti.", default=API_RPM_LIMIT) # <-- RPM argümanı
-    parser.add_argument("--log_level", choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'], default='INFO', help="Ayarlanacak loglama seviyesi.")
+    parser.add_argument("image_dir", help="Path to the directory containing images to be annotated.")
+    parser.add_argument("output_dir", help="Directory where the generated YOLO annotation (.txt) files will be saved.")
+    parser.add_argument("class_list_path", help="Path to the .txt file containing one class name per line.")
+    parser.add_argument("--api_key", help="Google Gemini API key. If not specified, it reads from the GOOGLE_API_KEY environment variable.", default=None)
+    parser.add_argument("--model_name", help="Gemini model to use.", default=DEFAULT_GEMINI_MODEL)
+    parser.add_argument("--max_workers", type=int, help="Maximum number of worker threads for parallel processing.", default=DEFAULT_MAX_WORKERS)
+    parser.add_argument("--rpm", type=int, help="Maximum API requests per minute limit.", default=API_RPM_LIMIT) # <-- RPM argument
+    parser.add_argument("--log_level", choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'], default='INFO', help="Logging level to set.")
 
     args = parser.parse_args()
 
+    # Set logging level based on argument
     logger.setLevel(args.log_level.upper())
 
+    # Get API key from argument or environment variable
     api_key = args.api_key or os.environ.get("GOOGLE_API_KEY")
     if not api_key:
-        logger.critical("Google Gemini API anahtarı ne argüman olarak (--api_key) ne de GOOGLE_API_KEY ortam değişkeninde belirtilmemiş. İşlem durduruluyor.")
-        return 1
+        logger.critical("Google Gemini API key was not provided either via --api_key argument or GOOGLE_API_KEY environment variable. Stopping.")
+        return 1 # Indicate error
 
-    # RPM limitini process_dataset'e ilet
+    # Pass RPM limit to process_dataset
     process_dataset(
         image_dir=args.image_dir,
         output_dir=args.output_dir,
@@ -530,42 +578,42 @@ def main():
         api_key=api_key,
         model_name=args.model_name,
         max_workers=args.max_workers,
-        rpm_limit=args.rpm # <-- Argümanı fonksiyona geç
+        rpm_limit=args.rpm
     )
-    return 0
+    return 0 # Indicate success
 
 # --- Script Execution (Example) ---
-# Aşağıdaki kısım doğrudan çalıştırma içindir, argümanları buradan alır.
-# Komut satırından çalıştırmak için bu kısmı kaldırıp `if __name__ == "__main__": main()` kullanın.
+# The following section is for direct execution, taking arguments from here.
+# To run from the command line, remove this section and use `if __name__ == "__main__": main()`
 
-# Örnek Kullanım (Doğrudan çalıştırma için - Komut satırı yerine)
-API_KEY='' # <-- BURAYA KENDİ API ANAHTARINIZI GİRİN
-IMAGE_DIR='images' # <-- Görüntü klasörünüz
-OUTPUT_DIR='output' # <-- Çıktı klasörünüz
-CLASS_LIST_PATH='class_list.txt' # <-- Sınıf listeniz
-MODEL_NAME='gemini-2.0-flash' # <-- Model adı (1.5-flash veya 2.0-flash gibi)
-MAX_WORKERS=4 # <-- İşçi sayısı (RPM limitine dikkat!)
-RPM_LIMIT_VALUE = 15 # <-- Dakikadaki istek limiti (Free Tier için 15)
+# Example Usage (For direct execution - instead of command line)
+API_KEY='YOUR_API_KEY_HERE' # <-- ENTER YOUR OWN API KEY HERE
+IMAGE_DIR='images' # <-- Your image directory
+OUTPUT_DIR='output' # <-- Your output directory
+CLASS_LIST_PATH='class_list.txt' # <-- Your class list file
+MODEL_NAME='gemini-2.0-flash' # <-- Model name (e.g., 1.5-flash or higher)
+MAX_WORKERS=4 # <-- Number of workers (mind the RPM limit!)
+RPM_LIMIT_VALUE = 15 # <-- Requests per minute limit (e.g., 15 for Free Tier)
 
 if __name__ == "__main__":
-    # API Anahtarını kontrol et
+    # Check API Key
     api_key_to_use = API_KEY
     if not api_key_to_use or api_key_to_use == 'YOUR_API_KEY_HERE':
          env_key = os.environ.get("GOOGLE_API_KEY")
          if env_key:
               api_key_to_use = env_key
-              logger.info("GOOGLE_API_KEY ortam değişkeninden API anahtarı kullanılıyor.")
+              logger.info("Using API key from GOOGLE_API_KEY environment variable.")
          else:
-              logger.critical("Lütfen script içindeki API_KEY değişkenini veya GOOGLE_API_KEY ortam değişkenini ayarlayın.")
-              exit(1) # Hata koduyla çık
+              logger.critical("Please set the API_KEY variable in the script or the GOOGLE_API_KEY environment variable.")
+              exit(1) # Exit with error code
 
-    # Log seviyesini INFO olarak ayarla (veya DEBUG isterseniz)
+    # Set log level to INFO (or DEBUG if desired)
     logger.setLevel(logging.INFO)
 
-    # Python sürümünü kontrol et
+    # Check Python version
     check_python_version()
 
-    # Ana işlemi başlat
+    # Start the main process
     process_dataset(
         image_dir=IMAGE_DIR,
         output_dir=OUTPUT_DIR,
@@ -573,5 +621,5 @@ if __name__ == "__main__":
         api_key=api_key_to_use,
         model_name=MODEL_NAME,
         max_workers=MAX_WORKERS,
-        rpm_limit=RPM_LIMIT_VALUE # RPM limitini fonksiyona geç
+        rpm_limit=RPM_LIMIT_VALUE
     )

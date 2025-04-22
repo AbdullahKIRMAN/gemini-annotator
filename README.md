@@ -1,17 +1,20 @@
 # Gemini Annotater
 
-Gemini Annotater is a Python project that uses the Gemini API to annotate images in YOLO format. The project utilizes uv for Python package management.
+- Gemini Annotater is a Python project that uses the Gemini API to annotate images in YOLO format. The project utilizes uv for Python package management.
+- This project structured to use free Gemini API with rate limiting (15 RPM) and concurrent processing using a thread pool.
+- If you want to use the paid Gemini API, you can set the RPM limit to a higher value to process more images concurrently.
+
+- Try to use understandable names for the class_list.txt file to get better results.
 
 ## Features
 
 - Processes images to detect objects and generate YOLO format annotations.
 - Utilizes Gemini API with rate limiting.
 - Concurrent processing using a thread pool.
-- Easy customization via configuration in `pyproject.toml`.
 
 ## Requirements
 
-- Python >= 3.10
+- Python >= 3.9
 - google-genai >= 1.11.0
 - Pillow >= 11.2.1
 - ratelimiter >= 1.2.0.post0
@@ -29,6 +32,19 @@ Gemini Annotater is a Python project that uses the Gemini API to annotate images
    ```
 
 ## Usage
+Define your desired classes in the `class_list.txt` file. Each class should be on a new line.
+
+Enter your Gemini API key in the `main.py` file. You can also pass it as a command-line argument.
+You can set the `--api_key` argument to your Gemini API key. If you don't provide it, the script will use the default key in the code.
+
+You can also set the `--model_name` argument to specify the model you want to use. The default is `gemini-2.0-flash`.
+You can set the `--max_workers` argument to specify the number of concurrent threads. The default is 4.
+You can set the `--rpm` argument to specify the rate limit for the API. The default is 15 RPM.
+You can set the `--log_level` argument to specify the logging level. The default is `INFO`. You can set it to `DEBUG` for more detailed logs.
+You can set the `--output_dir` argument to specify the output directory for the annotations. The default is `output`.
+You can set the `--image_dir` argument to specify the directory containing the images to be annotated. The default is `images`.
+You can set the `--class_list` argument to specify the file containing the list of object classes. The default is `class_list.txt`.
+
 
 Run the following command to process a dataset:
 
