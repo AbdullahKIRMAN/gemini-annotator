@@ -3,6 +3,7 @@
 - Gemini Annotator is a Python project that uses the Gemini API to annotate images in YOLO format. The project utilizes uv for Python package management.
 - This project structured to use free Gemini API with rate limiting (15 RPM) and concurrent processing using a thread pool.
 - If you want to use the paid Gemini API, you can set the RPM limit to a higher value to process more images concurrently.
+- To continue previous runs, you can set the `--resume` argument to `True`. This will skip images that have already been processed.
 
 - Try to use understandable names for the class_list.txt file to get better results.
 
@@ -44,6 +45,7 @@ You can set the `--log_level` argument to specify the logging level. The default
 You can set the `--output_dir` argument to specify the output directory for the annotations. The default is `output`.
 You can set the `--image_dir` argument to specify the directory containing the images to be annotated. The default is `images`.
 You can set the `--class_list` argument to specify the file containing the list of object classes. The default is `class_list.txt`.
+You can set the `--resume` argument to specify whether to resume from a previous run. The default is `False`. If set to `True`, the script will skip images that have already been processed.
 
 
 Run the following command to process a dataset:
@@ -55,7 +57,7 @@ python main.py <image_dir> <output_dir> <class_list.txt> [--api_key YOUR_API_KEY
 Example:
 
 ```
-python main.py images output class_list.txt --api_key YOUR_API_KEY --model_name gemini-2.0-flash --max_workers 4 --rpm 15
+python main.py images output class_list.txt --api_key YOUR_API_KEY --model_name gemini-2.0-flash --max_workers 4 --rpm 15 --resume True
 ```
 
 ## Project Structure
