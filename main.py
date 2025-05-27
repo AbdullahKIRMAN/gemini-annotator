@@ -511,6 +511,7 @@ def process_dataset(
 
     os.makedirs(output_dir, exist_ok=True)
 
+
     try:
         class_list = load_class_list(class_list_path)
         class_mapping = create_class_mapping(class_list)
@@ -687,7 +688,7 @@ def main():
 # Example Usage (For direct execution - instead of command line)
 # Set these variables according to your setup
 RUN_DIRECTLY = True # Set to False to use command-line arguments instead
-API_KEY='YOUR_API_KEY_HERE' # <-- ENTER YOUR OWN API KEY HERE
+API_KEY='AIzaSyBThoDGTEs0M0Rk4LG--YVtw1AuUEc1Byo' # <-- ENTER YOUR OWN API KEY HERE
 IMAGE_DIR='images' # <-- Your image directory
 OUTPUT_DIR='output' # <-- Your output directory
 CLASS_LIST_PATH='class_list.txt' # <-- Your class list file
@@ -697,40 +698,176 @@ RPM_LIMIT_VALUE = 15 # <-- Requests per minute limit (e.g., 15 for Free Tier)
 RESUME_PROCESSING = True # <-- Set to True to enable resume mode when running directly
 LOG_LEVEL_DIRECT = logging.INFO # <-- Set desired log level (e.g., logging.DEBUG)
 
+
+# --------------------------- Direct‑run defaults -----------------------------
+IMAGE_DIR        = "images"
+OUTPUT_DIR       = "output"
+CLASS_LIST_PATH  = "class_list.txt"
+MODEL_NAME       = DEFAULT_GEMINI_MODEL
+MAX_WORKERS      = DEFAULT_MAX_WORKERS
+RPM_LIMIT        = API_RPM_LIMIT
+RESUME           = True
+# 💡 NEW: explicit three-way split ratios (must sum to 1)
+TRAIN_RATIO      = 0.7
+VAL_RATIO        = 0.2
+TEST_RATIO       = 0.1
+API_KEY          = "AIzaSyBThoDGTEs0M0Rk4LG--YVtw1AuUEc1Byo"
+
+# -----------------------------------------------------------------------------
+#                           Module entry point
+# -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    if RUN_DIRECTLY:
-        # Check API Key
-        api_key_to_use = API_KEY
-        if not api_key_to_use or api_key_to_use == 'YOUR_API_KEY_HERE':
-             env_key = os.environ.get("GOOGLE_API_KEY")
-             if env_key:
-                  api_key_to_use = env_key
-                  logger.info("Using API key from GOOGLE_API_KEY environment variable.")
-             else:
-                  logger.critical("Please set the API_KEY variable in the script or the GOOGLE_API_KEY environment variable.")
-                  exit(1) # Exit with error code
+    import random, shutil, pathlib, sys, os, textwrap
 
-        # Set log level
-        logger.setLevel(LOG_LEVEL_DIRECT)
-        for handler in logger.handlers:
-            handler.setLevel(LOG_LEVEL_DIRECT)
-        logger.info(f"Direct execution mode. Log level set to {logging.getLevelName(LOG_LEVEL_DIRECT)}")
+    # -------------------- helper: write data.yaml --------------------
+    def write_data_yaml(output_dir: str, class_list: list[str]):
+        yaml_path = pathlib.Path(output_dir) / "data.yaml"
+        nc = len(class_list)
+        names_str = ", ".join(f"'{n}'" for n in class_list)
+        text = textwrap.dedent(
+            f"""
+            train: ../train/images
+            val: ../val/images
+            test: ../test/images
 
+            nc: {nc}
+            names: [{names_str}]
 
-        # Check Python version
-        check_python_version()
+            roboflow:
+              workspace: general-ecrbw
+              project: general_gemini
+              version: 1
+              license: CC BY 4.0
+              url: https://universe.roboflow.com/general-ecrbw/general_gemini/dataset/1
+            """
+        ).lstrip()
+        try:
+            yaml_path.write_text(text, encoding="utf-8")
+            logger.info("data.yaml written → %s", yaml_path)
+        except Exception as e:
+            logger.error("Could not write data.yaml: %s", e)
 
-        # Start the main process
+    # ---------------------- helper: split_dataset --------------------
+    def split_dataset(
+        image_dir: str,
+        output_dir: str,
+        train_ratio: float = 0.7,
+        val_ratio: float = 0.2,
+        test_ratio: float = 0.1,
+    ):
+        """Move image/label pairs into train/ val/ test/ folders."""
+        if not abs((train_ratio + val_ratio + test_ratio) - 1.0) < 1e-6:
+            raise ValueError("Split ratios must sum to 1.0")
+        SUPPORTED_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
+        lbl_files = [p for p in pathlib.Path(output_dir).iterdir() if p.suffix == ".txt"]
+        if not lbl_files:
+            logger.warning("No annotation files found for splitting – skipping.")
+            return
+        pairs = []
+        for lbl in lbl_files:
+            stem = lbl.stem
+            img = next(
+                (
+                    pathlib.Path(image_dir) / f"{stem}{ext}"
+                    for ext in SUPPORTED_EXTS
+                    if (pathlib.Path(image_dir) / f"{stem}{ext}").exists()
+                ),
+                None,
+            )
+            if img:
+                pairs.append((img, lbl))
+            else:
+                logger.warning("Image for %s not found; skipping pair.", lbl.name)
+        if not pairs:
+            logger.warning("No image/label pairs to move – aborting split.")
+            return
+        random.seed(42)
+        random.shuffle(pairs)
+        n = len(pairs)
+        n_train = int(n * train_ratio)
+        n_val   = int(n * val_ratio)
+        train_pairs = pairs[:n_train]
+        val_pairs   = pairs[n_train:n_train + n_val]
+        test_pairs  = pairs[n_train + n_val:]
+
+        def _d(p):
+            p.mkdir(parents=True, exist_ok=True)
+            return p
+
+        dirs = {
+            "train_img": _d(pathlib.Path(output_dir) / "train" / "images"),
+            "train_lbl": _d(pathlib.Path(output_dir) / "train" / "labels"),
+            "val_img":   _d(pathlib.Path(output_dir) / "val" / "images"),
+            "val_lbl":   _d(pathlib.Path(output_dir) / "val" / "labels"),
+            "test_img":  _d(pathlib.Path(output_dir) / "test" / "images"),
+            "test_lbl":  _d(pathlib.Path(output_dir) / "test" / "labels"),
+        }
+
+        def _mv(src: pathlib.Path, dst_dir: pathlib.Path):
+            dst = dst_dir / src.name
+            if dst.exists():
+                return
+            try:
+                shutil.move(str(src), str(dst))
+            except Exception as e:
+                logger.error("Move failed %s → %s: %s", src, dst, e)
+
+        for img, lbl in train_pairs:
+            _mv(img, dirs["train_img"])
+            _mv(lbl, dirs["train_lbl"])
+        for img, lbl in val_pairs:
+            _mv(img, dirs["val_img"])
+            _mv(lbl, dirs["val_lbl"])
+        for img, lbl in test_pairs:
+            _mv(img, dirs["test_img"])
+            _mv(lbl, dirs["test_lbl"])
+
+        logger.info(
+            "Split complete – train %d, val %d, test %d (ratios %.2f/%.2f/%.2f)",
+            len(train_pairs), len(val_pairs), len(test_pairs),
+            train_ratio, val_ratio, test_ratio,
+        )
+        # Write YAML
+        try:
+            with open(CLASS_LIST_PATH, "r", encoding="utf-8") as fh:
+                cls_names = [ln.strip() for ln in fh if ln.strip()]
+            write_data_yaml(output_dir, cls_names)
+        except Exception as e:
+            logger.error("Unable to read classes for data.yaml: %s", e)
+
+    def post_split(img_dir: str, out_dir: str):
+        logger.info("🏁 Annotation phase finished – starting dataset split …")
+        split_dataset(img_dir, out_dir, TRAIN_RATIO, VAL_RATIO, TEST_RATIO)
+        logger.info("✅ Split completed.")
+
+    # ------------------- Choose CLI vs direct defaults -----------------
+    if len(sys.argv) > 1:
+        code = main()
+        if code == 0:
+            img_dir = os.environ.get("IMAGE_DIR", IMAGE_DIR)
+            out_dir = os.environ.get("OUTPUT_DIR", OUTPUT_DIR)
+            post_split(img_dir, out_dir)
+        sys.exit(code)
+
+    logger.info("No CLI args – using internal defaults.")
+    key = os.environ.get("GOOGLE_API_KEY") or API_KEY
+    if not key:
+        logger.critical("Google API key missing.")
+        sys.exit(1)
+    try:
         process_dataset(
             image_dir=IMAGE_DIR,
             output_dir=OUTPUT_DIR,
             class_list_path=CLASS_LIST_PATH,
-            api_key=api_key_to_use,
+            api_key=key,
             model_name=MODEL_NAME,
             max_workers=MAX_WORKERS,
-            rpm_limit=RPM_LIMIT_VALUE,
-            resume=RESUME_PROCESSING # <-- Pass resume flag
+            rpm_limit=RPM_LIMIT,
+            resume=RESUME,
         )
-    else:
-        # Run via command-line arguments
-        sys.exit(main()) # Use sys.exit to return the status code from main
+        post_split(IMAGE_DIR, OUTPUT_DIR)
+        sys.exit(0)
+    except Exception as e:
+        logger.error("Fatal error: %s", e)
+        sys.exit(2)
+

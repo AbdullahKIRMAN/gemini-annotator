@@ -1,2 +1,8 @@
+fire
+forklift
+license_plate
+machine
+material
 person
-car
+smoke
+vehicle

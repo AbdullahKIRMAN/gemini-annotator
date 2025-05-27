@@ -1,0 +1,4 @@
+# Python virtual environment
+.venv/
+images
+output
