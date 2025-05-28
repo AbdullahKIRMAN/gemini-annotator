@@ -34,7 +34,7 @@ DEFAULT_MAX_WORKERS = 4
 RETRY_ATTEMPTS = 3
 RETRY_WAIT_MULTIPLIER = 10
 RETRY_WAIT_MAX = 40
-API_RPM_LIMIT = 15 # Requests per minute limit (adjust based on your tier)
+API_RPM_LIMIT = 1500 # Requests per minute limit (adjust based on your tier)
 API_REQUEST_PERIOD = 60 # seconds (1 minute)
 
 RETRYABLE_EXCEPTIONS = (
@@ -694,7 +694,7 @@ OUTPUT_DIR='output' # <-- Your output directory
 CLASS_LIST_PATH='class_list.txt' # <-- Your class list file
 MODEL_NAME='gemini-2.0-flash' # <-- Model name (e.g., 1.5-flash or higher)
 MAX_WORKERS=4 # <-- Number of workers (mind the RPM limit!)
-RPM_LIMIT_VALUE = 15 # <-- Requests per minute limit (e.g., 15 for Free Tier)
+RPM_LIMIT_VALUE = 1500 # <-- Requests per minute limit (e.g., 15 for Free Tier)
 RESUME_PROCESSING = True # <-- Set to True to enable resume mode when running directly
 LOG_LEVEL_DIRECT = logging.INFO # <-- Set desired log level (e.g., logging.DEBUG)
 
@@ -711,7 +711,7 @@ RESUME           = True
 TRAIN_RATIO      = 0.7
 VAL_RATIO        = 0.2
 TEST_RATIO       = 0.1
-API_KEY          = "AIzaSyBThoDGTEs0M0Rk4LG--YVtw1AuUEc1Byo"
+API_KEY          = "AIzaSyD3QtVvXE_U-xVCq4yX5TtVUWKKaT56vYU"
 
 # -----------------------------------------------------------------------------
 #                           Module entry point

@@ -1,8 +1,11 @@
 fire
+smoke
+car
+truck
+van
+gloves
+helmet
+safety_vest
 forklift
 license_plate
-machine
-material
 person
-smoke
-vehicle
