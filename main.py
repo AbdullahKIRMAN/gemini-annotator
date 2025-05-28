@@ -688,7 +688,7 @@ def main():
 # Example Usage (For direct execution - instead of command line)
 # Set these variables according to your setup
 RUN_DIRECTLY = True # Set to False to use command-line arguments instead
-API_KEY='AIzaSyBThoDGTEs0M0Rk4LG--YVtw1AuUEc1Byo' # <-- ENTER YOUR OWN API KEY HERE
+API_KEY='your key here' # <-- ENTER YOUR OWN API KEY HERE
 IMAGE_DIR='images' # <-- Your image directory
 OUTPUT_DIR='output' # <-- Your output directory
 CLASS_LIST_PATH='class_list.txt' # <-- Your class list file
@@ -711,7 +711,7 @@ RESUME           = True
 TRAIN_RATIO      = 0.7
 VAL_RATIO        = 0.2
 TEST_RATIO       = 0.1
-API_KEY          = "AIzaSyD3QtVvXE_U-xVCq4yX5TtVUWKKaT56vYU"
+API_KEY          = "your key here"
 
 # -----------------------------------------------------------------------------
 #                           Module entry point
