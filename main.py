@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
+
+from dotenv import load_dotenv
+load_dotenv()
 from google import genai
 from google.genai import types
 from google.genai import errors as genai_errors
 
 from PIL import Image
-import os
 import json
 import logging
 import argparse
@@ -14,7 +16,6 @@ from typing import List, Dict, Tuple, Optional, Any
 import time
 import mimetypes
 from ratelimiter import RateLimiter
-import sys # Import sys for version check and exit
 
 # --- Logging Configuration ---
 logging.basicConfig(
@@ -645,7 +646,7 @@ def main():
     parser.add_argument("image_dir", help="Path to the directory containing images to be annotated.")
     parser.add_argument("output_dir", help="Directory where the generated YOLO annotation (.txt) files will be saved.")
     parser.add_argument("class_list_path", help="Path to the .txt file containing one class name per line.")
-    parser.add_argument("--api_key", help="Google Gemini API key. If not specified, it reads from the GOOGLE_API_KEY environment variable.", default=None)
+    parser.add_argument("--api_key", help="Google Gemini API key. it reads from the GOOGLE_API_KEY environment variable.", default=None)
     parser.add_argument("--model_name", help="Gemini model to use.", default=DEFAULT_GEMINI_MODEL)
     parser.add_argument("--max_workers", type=int, help="Maximum number of worker threads for parallel processing.", default=DEFAULT_MAX_WORKERS)
     parser.add_argument("--rpm", type=int, help="Maximum API requests per minute limit.", default=API_RPM_LIMIT)
@@ -663,7 +664,7 @@ def main():
 
 
     # Get API key from argument or environment variable
-    api_key = args.api_key or os.environ.get("GOOGLE_API_KEY")
+    api_key = os.environ.get("GOOGLE_API_KEY")
     if not api_key:
         logger.critical("Google Gemini API key was not provided either via --api_key argument or GOOGLE_API_KEY environment variable. Stopping.")
         return 1 # Indicate error
@@ -688,13 +689,9 @@ def main():
 # Example Usage (For direct execution - instead of command line)
 # Set these variables according to your setup
 RUN_DIRECTLY = True # Set to False to use command-line arguments instead
-API_KEY='your key here' # <-- ENTER YOUR OWN API KEY HERE
-IMAGE_DIR='images' # <-- Your image directory
-OUTPUT_DIR='output' # <-- Your output directory
-CLASS_LIST_PATH='class_list.txt' # <-- Your class list file
 MODEL_NAME='gemini-2.0-flash' # <-- Model name (e.g., 1.5-flash or higher)
 MAX_WORKERS=4 # <-- Number of workers (mind the RPM limit!)
-RPM_LIMIT_VALUE = 1500 # <-- Requests per minute limit (e.g., 15 for Free Tier)
+RPM_LIMIT_VALUE = 15# <-- Requests per minute limit (e.g., 15 for Free Tier)
 RESUME_PROCESSING = True # <-- Set to True to enable resume mode when running directly
 LOG_LEVEL_DIRECT = logging.INFO # <-- Set desired log level (e.g., logging.DEBUG)
 
@@ -703,15 +700,11 @@ LOG_LEVEL_DIRECT = logging.INFO # <-- Set desired log level (e.g., logging.DEBUG
 IMAGE_DIR        = "images"
 OUTPUT_DIR       = "output"
 CLASS_LIST_PATH  = "class_list.txt"
-MODEL_NAME       = DEFAULT_GEMINI_MODEL
-MAX_WORKERS      = DEFAULT_MAX_WORKERS
-RPM_LIMIT        = API_RPM_LIMIT
 RESUME           = True
 # 💡 NEW: explicit three-way split ratios (must sum to 1)
 TRAIN_RATIO      = 0.7
 VAL_RATIO        = 0.2
 TEST_RATIO       = 0.1
-API_KEY          = "your key here"
 
 # -----------------------------------------------------------------------------
 #                           Module entry point
@@ -850,7 +843,7 @@ if __name__ == "__main__":
         sys.exit(code)
 
     logger.info("No CLI args – using internal defaults.")
-    key = os.environ.get("GOOGLE_API_KEY") or API_KEY
+    key = os.environ.get("GOOGLE_API_KEY")
     if not key:
         logger.critical("Google API key missing.")
         sys.exit(1)
@@ -862,7 +855,7 @@ if __name__ == "__main__":
             api_key=key,
             model_name=MODEL_NAME,
             max_workers=MAX_WORKERS,
-            rpm_limit=RPM_LIMIT,
+            rpm_limit=RPM_LIMIT_VALUE,
             resume=RESUME,
         )
         post_split(IMAGE_DIR, OUTPUT_DIR)
