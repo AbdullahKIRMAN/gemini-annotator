@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
+import io
 
 from dotenv import load_dotenv
+
 load_dotenv()
 from google import genai
 from google.genai import types
@@ -35,16 +37,18 @@ DEFAULT_MAX_WORKERS = 4
 RETRY_ATTEMPTS = 3
 RETRY_WAIT_MULTIPLIER = 10
 RETRY_WAIT_MAX = 40
-API_RPM_LIMIT = 1500 # Requests per minute limit (adjust based on your tier)
-API_REQUEST_PERIOD = 60 # seconds (1 minute)
+API_RPM_LIMIT = 1500  # Requests per minute limit (adjust based on your tier)
+API_REQUEST_PERIOD = 60  # seconds (1 minute)
+TARGET_SQUARE_SIZE = (1280, 1280)
 
 RETRYABLE_EXCEPTIONS = (
     genai_errors.ServerError,
     genai_errors.ClientError,
-    TimeoutError,                       # General timeout
+    TimeoutError,  # General timeout
     genai_errors.APIError,
 )
 PYTHON_MIN_VERSION = (3, 9)
+
 
 # --- Helper Functions ---
 
@@ -57,6 +61,7 @@ def check_python_version():
             f"Current version: {sys.version.split()[0]}"
         )
         sys.exit(1)
+
 
 def get_mime_type(filename: str) -> str:
     """Guesses the MIME type from the filename."""
@@ -75,11 +80,12 @@ def get_mime_type(filename: str) -> str:
     logger.warning(f"Could not guess MIME type for: {filename}. Using 'application/octet-stream'.")
     return 'application/octet-stream'
 
+
 def get_image_dimensions(image_path: str) -> Optional[Tuple[int, int]]:
     """Returns the width and height of the given image."""
     try:
         with Image.open(image_path) as img:
-            img.verify() # Verify headers without loading full image data
+            img.verify()  # Verify headers without loading full image data
         # Re-open after verify to get dimensions
         with Image.open(image_path) as img:
             return img.width, img.height
@@ -87,11 +93,12 @@ def get_image_dimensions(image_path: str) -> Optional[Tuple[int, int]]:
         logger.error(f"Image not found: {image_path}")
         return None
     except (IOError, SyntaxError, Image.UnidentifiedImageError) as e:
-         logger.error(f"Could not read or invalid image file ({image_path}): {e}")
-         return None
+        logger.error(f"Could not read or invalid image file ({image_path}): {e}")
+        return None
     except Exception as e:
         logger.error(f"Error getting image dimensions ({image_path}): {e}", exc_info=True)
         return None
+
 
 def load_class_list(filepath: str) -> List[str]:
     """Reads the class list from the given file (one class per line)."""
@@ -110,94 +117,77 @@ def load_class_list(filepath: str) -> List[str]:
         logger.error(f"Error reading class list file ({filepath}): {e}", exc_info=True)
         raise
 
+
 def create_class_mapping(class_list: List[str]) -> Dict[str, int]:
     """Creates a class name -> class ID mapping from the class list."""
     return {class_name.lower(): i for i, class_name in enumerate(class_list)}
 
-def convert_gemini_to_yolo(
-    gemini_annotations: List[Dict[str, Any]],
-    class_mapping: Dict[str, int],
-    image_path: str # For logging
-) -> List[str]:
+
+def resize_and_pad_to_square(image: Image.Image, target_size: Tuple[int, int], fill_color: Tuple[int, int, int] = (0, 0, 0)) -> Image.Image:
     """
-    Converts annotations received from the Gemini API to YOLO format.
-    Expects Gemini's [ymin, xmin, ymax, xmax] (normalized 0-1000) format.
+    Resmi, en-boy oranını koruyarak hedef boyuta sığdırır ve boşlukları siyahla doldurur.
+    """
+    original_width, original_height = image.size
+    ratio = min(target_size[0] / original_width, target_size[1] / original_height)
+    new_width = int(original_width * ratio)
+    new_height = int(original_height * ratio)
+
+    # Yüksek kaliteli yeniden boyutlandırma için LANCZOS filtresi kullanılır
+    resized_image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+
+    # Yeni bir kare tuval oluştur ve resmi ortasına yapıştır
+    padded_image = Image.new("RGB", target_size, fill_color)
+    paste_x = (target_size[0] - new_width) // 2
+    paste_y = (target_size[1] - new_height) // 2
+    padded_image.paste(resized_image, (paste_x, paste_y))
+
+    return padded_image
+
+
+def convert_gemini_to_yolo(gemini_annotations: List[Dict[str, Any]], class_mapping: Dict[str, int], image_path: str) -> List[str]:
+    """
+    Kare bir resimden gelen Gemini etiketlerini doğrudan YOLO formatına dönüştürür.
+    Artık karmaşık en-boy oranı matematiğine gerek yok.
     """
     yolo_annotations = []
     if not isinstance(gemini_annotations, list):
-         logger.warning(f"Unexpected Gemini output format (not a list): {gemini_annotations} - Image: {image_path}")
-         return []
+        logger.warning(f"Unexpected Gemini output format (not a list): {gemini_annotations} - Image: {image_path}")
+        return []
 
-    for ann_index, annotation in enumerate(gemini_annotations):
-        if not isinstance(annotation, dict):
-            logger.warning(f"Unexpected annotation format (not a dictionary): {annotation} at index {ann_index} - Image: {image_path}")
-            continue
-
+    for annotation in gemini_annotations:
         try:
-            # Case-insensitive key matching
             box_key = next((k for k in annotation if k.lower() == "box_2d"), None)
             label_key = next((k for k in annotation if k.lower() == "label"), None)
-
-            if not box_key or not label_key:
-                # Check if maybe the keys are slightly different (e.g., 'bounding_box') - adapt if needed
-                logger.warning(f"Missing 'box_2d' or 'label' key (or variants): {annotation} - Image: {image_path}")
-                continue
+            if not box_key or not label_key: continue
 
             box = annotation[box_key]
-            label = str(annotation[label_key]).lower() # Convert label to lower case for mapping
-
-            if not isinstance(box, list) or len(box) != 4:
-                logger.warning(f"Invalid 'box_2d' format: {box} - Image: {image_path}")
-                continue
-
-            if label not in class_mapping:
-                logger.debug(f"Class '{label}' not found in class mapping. Skipping. Image: {image_path}")
-                continue
+            label = str(annotation[label_key]).lower()
+            if label not in class_mapping: continue
+            if not isinstance(box, list) or len(box) != 4: continue
 
             class_id = class_mapping[label]
+            ymin, xmin, ymax, xmax = map(float, box)
 
-            try:
-                # Ensure coordinates are numeric before conversion
-                if not all(isinstance(coord, (int, float)) for coord in box):
-                    raise TypeError(f"Coordinates must be numeric: {box}")
-                ymin, xmin, ymax, xmax = map(float, box)
-            except (ValueError, TypeError) as e:
-                logger.warning(f"Invalid coordinate value or type: {box} ({e}) - Image: {image_path}")
-                continue
-
-            # Validate coordinates are within 0-1000 and logical (min < max)
-            if not (0 <= ymin <= 1000 and 0 <= xmin <= 1000 and 0 <= ymax <= 1000 and 0 <= xmax <= 1000):
-                logger.warning(f"Coordinate values out of range [0, 1000]: {box} - Image: {image_path}")
-                continue
-            if not (xmin < xmax and ymin < ymax):
-                 logger.warning(f"Invalid box coordinates (min >= max): {box} - Image: {image_path}")
-                 continue
-
-            # Convert to YOLO format (center_x, center_y, width, height) normalized 0-1
+            # Doğrudan ve basit dönüşüm (artık karmaşık matematik yok)
             x_center = ((xmin + xmax) / 2) / 1000.0
             y_center = ((ymin + ymax) / 2) / 1000.0
-            bbox_width = (xmax - xmin) / 1000.0
-            bbox_height = (ymax - ymin) / 1000.0
+            width = (xmax - xmin) / 1000.0
+            height = (ymax - ymin) / 1000.0
 
-            # Clamp values to [0.0, 1.0] to handle potential minor floating point inaccuracies or slight overruns
-            x_center = max(0.0, min(1.0, x_center))
-            y_center = max(0.0, min(1.0, y_center))
-            bbox_width = max(0.0, min(1.0, bbox_width))
-            bbox_height = max(0.0, min(1.0, bbox_height))
-
-            # Final check for valid width/height after clamping
-            if bbox_width <= 0 or bbox_height <= 0:
-                logger.warning(f"Calculated zero or negative width/height after normalization/clamping: w={bbox_width}, h={bbox_height}. Original box: {box} - Image: {image_path}")
+            # Güvenlik kontrolü
+            if not (0.0 <= x_center <= 1.0 and 0.0 <= y_center <= 1.0 and width > 0 and height > 0):
+                logger.warning(f"Hesaplama sonrası geçersiz koordinat. Kutu: {box}, Resim: {image_path}. Atlanıyor.")
                 continue
 
-            yolo_line = f"{class_id} {x_center:.6f} {y_center:.6f} {bbox_width:.6f} {bbox_height:.6f}"
+            yolo_line = f"{class_id} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f}"
             yolo_annotations.append(yolo_line)
 
         except Exception as e:
-            logger.error(f"Annotation conversion error ({annotation}): {e} - Image: {image_path}", exc_info=True)
+            logger.error(f"Anotasyon dönüşüm hatası ({annotation}): {e} - Resim: {image_path}", exc_info=True)
             continue
 
     return yolo_annotations
+
 
 # --- Gemini API Interaction ---
 
@@ -211,35 +201,38 @@ def should_retry_api_call(exception):
         logger.error(f"Detected non-retryable error: {type(exception).__name__} - {exception}")
     return is_retryable
 
+
 @retry(
     stop=stop_after_attempt(RETRY_ATTEMPTS),
-    wait=wait_exponential(multiplier=RETRY_WAIT_MULTIPLIER, min=4, max=RETRY_WAIT_MAX), # Added min wait
-    retry=retry_if_exception_type(RETRYABLE_EXCEPTIONS), # Use tuple directly
+    wait=wait_exponential(multiplier=RETRY_WAIT_MULTIPLIER, min=4, max=RETRY_WAIT_MAX),  # Added min wait
+    retry=retry_if_exception_type(RETRYABLE_EXCEPTIONS),  # Use tuple directly
     # retry=retry_if_exception(should_retry_api_call), # Use custom function if more logic needed
     before_sleep=lambda retry_state: logger.warning(
-        f"Retrying API call for {retry_state.args[2] if len(retry_state.args) > 2 else 'unknown image'}... " # Log image path if possible
+        f"Retrying API call for {retry_state.args[2] if len(retry_state.args) > 2 else 'unknown image'}... "  # Log image path if possible
         f"(Attempt {retry_state.attempt_number}/{RETRY_ATTEMPTS}, waiting {retry_state.idle_for:.2f}s). "
         f"Reason: {type(retry_state.outcome.exception()).__name__}"
     )
 )
 def call_gemini_api(
-    client: genai.Client,
-    model_name: str,
-    image_path: str,
-    class_list: List[str],
-    limiter: RateLimiter
+        client: genai.Client,
+        model_name: str,
+        image_bytes: bytes,
+        class_list: List[str],
+        limiter: RateLimiter,
+        image_path_for_logging: str
 ) -> Optional[List[Dict[str, Any]]]:
-    """Calls the Gemini API using client.generate_content and applies rate limiting."""
+    """Calls the Gemini API using image data in memory (bytes)."""
     try:
-        logger.debug(f"Preparing Gemini API call: {image_path}")
-        with open(image_path, "rb") as image_file:
-            image_data = image_file.read()
-            if not image_data:
-                logger.error(f"Image file is empty: {image_path}")
-                return None
+        # DEĞİŞİKLİK: Dosya okuma kısmı kaldırıldı, doğrudan byte'lar kullanılıyor
+        logger.debug(f"Preparing Gemini API call for: {image_path_for_logging}")
+        if not image_bytes:
+            logger.error(f"Image data is empty for: {image_path_for_logging}")
+            return None
 
-        mime_type = get_mime_type(image_path)
-        image_part = types.Part.from_bytes(data=image_data, mime_type=mime_type)
+        # MIME type'ı sabit olarak 'image/jpeg' yapabiliriz çünkü hep o formatta göndereceğiz
+        image_part = types.Part.from_bytes(data=image_bytes, mime_type='image/jpeg')
+
+        filename_hint = os.path.basename(image_path_for_logging)
 
         prompt = f"""
         Analyze the provided image and identify all objects belonging ONLY to the following classes: {', '.join(class_list)}.
@@ -265,73 +258,74 @@ def call_gemini_api(
         contents = [image_part, text_part]
 
         generation_config = types.GenerateContentConfig(
-            temperature=0.1, # lower temperature for consistency
-            response_mime_type='application/json', # Request JSON output directly
+            temperature=0.1,  # lower temperature for consistency
+            response_mime_type='application/json',  # Request JSON output directly
         )
 
         # --- Rate Limiting ---
-        logger.debug(f"Waiting for rate limiter (limit: {limiter.max_calls}/{limiter.period}s)... {image_path}")
-        with limiter: # <-- Rate limiter engages here
-            logger.debug(f"Rate limiter passed, calling API... {image_path}")
+        logger.debug(f"Waiting for rate limiter (limit: {limiter.max_calls}/{limiter.period}s)... {image_path_for_logging}")
+        with limiter:  # <-- Rate limiter engages here
+            logger.debug(f"Rate limiter passed, calling API... {image_path_for_logging}")
             # API call
-            response = client.models.generate_content( # Use the standard client method
+            response = client.models.generate_content(  # Use the standard client method
                 model=f'models/{model_name}',
                 contents=contents,
-                config=generation_config # Pass config here
+                config=generation_config  # Pass config here
                 # request_options={"timeout": 60} # Optional timeout
             )
-            logger.debug(f"API call completed. {image_path}")
+            logger.debug(f"API call completed. {image_path_for_logging}")
         # --- /Rate Limiting ---
 
-
         if not response.candidates:
-             # Check for prompt feedback if available
-             block_reason = "Unknown"
-             safety_ratings_str = "N/A"
-             if response.prompt_feedback:
-                 block_reason = response.prompt_feedback.block_reason.name if response.prompt_feedback.block_reason else "Not Blocked"
-                 safety_ratings_str = ", ".join([f"{sr.category.name}: {sr.probability.name}" for sr in response.prompt_feedback.safety_ratings]) if response.prompt_feedback.safety_ratings else "None"
+            # Check for prompt feedback if available
+            block_reason = "Unknown"
+            safety_ratings_str = "N/A"
+            if response.prompt_feedback:
+                block_reason = response.prompt_feedback.block_reason.name if response.prompt_feedback.block_reason else "Not Blocked"
+                safety_ratings_str = ", ".join(
+                    [f"{sr.category.name}: {sr.probability.name}" for sr in response.prompt_feedback.safety_ratings]) if response.prompt_feedback.safety_ratings else "None"
 
-             logger.warning(f"No valid candidate response received from Gemini. Image: {image_path}. Block Reason: {block_reason}. Safety Ratings: [{safety_ratings_str}]")
-             # If blocked due to safety, treat as failure for this image
-             if response.prompt_feedback and response.prompt_feedback.block_reason != types.SafetySetting.HarmBlockThreshold.BLOCK_NONE:
-                  return None # Blocked, treat as failure
-             # Otherwise, might be an issue, return empty list as a fallback? Or None? Let's return None.
-             return None
+            logger.warning(
+                f"No valid candidate response received from Gemini. Image: {image_path_for_logging}. Block Reason: {block_reason}. Safety Ratings: [{safety_ratings_str}]")
+            # If blocked due to safety, treat as failure for this image
+            if response.prompt_feedback and response.prompt_feedback.block_reason != types.SafetySetting.HarmBlockThreshold.BLOCK_NONE:
+                return None  # Blocked, treat as failure
+            # Otherwise, might be an issue, return empty list as a fallback? Or None? Let's return None.
+            return None
 
         candidate = response.candidates[0]
 
         # Check finish reason for potential issues
         if candidate.finish_reason != types.FinishReason.STOP:
-             finish_reason_name = candidate.finish_reason.name
-             safety_ratings_str = ", ".join([f"{sr.category.name}: {sr.probability.name}" for sr in candidate.safety_ratings]) if candidate.safety_ratings else "None"
-             logger.warning(f"Gemini response finished unexpectedly. Reason: {finish_reason_name}. Image: {image_path}. Safety Ratings: [{safety_ratings_str}]")
+            finish_reason_name = candidate.finish_reason.name
+            safety_ratings_str = ", ".join([f"{sr.category.name}: {sr.probability.name}" for sr in candidate.safety_ratings]) if candidate.safety_ratings else "None"
+            logger.warning(f"Gemini response finished unexpectedly. Reason: {finish_reason_name}. Image: {image_path_for_logging}. Safety Ratings: [{safety_ratings_str}]")
 
-             # Specific handling based on finish reason
-             if finish_reason_name == "MAX_TOKENS":
-                  logger.error(f"Response truncated due to MAX_TOKENS limit. Image: {image_path}. Consider adjusting model or prompt if response is too large.")
-             elif finish_reason_name == "SAFETY":
-                  logger.error(f"Response blocked due to SAFETY reasons during generation. Image: {image_path}. Safety Ratings: [{safety_ratings_str}]")
-             elif finish_reason_name == "RECITATION":
-                  logger.warning(f"Response potentially blocked due to RECITATION. Image: {image_path}.")
-             elif finish_reason_name == "OTHER":
-                  logger.warning(f"Response finished due to 'OTHER' (could be API limit, internal error). Image: {image_path}.")
-             # Any non-STOP finish reason is treated as a failure for this annotation task
-             return None # Mark as error
+            # Specific handling based on finish reason
+            if finish_reason_name == "MAX_TOKENS":
+                logger.error(f"Response truncated due to MAX_TOKENS limit. Image: {image_path_for_logging}. Consider adjusting model or prompt if response is too large.")
+            elif finish_reason_name == "SAFETY":
+                logger.error(f"Response blocked due to SAFETY reasons during generation. Image: {image_path_for_logging}. Safety Ratings: [{safety_ratings_str}]")
+            elif finish_reason_name == "RECITATION":
+                logger.warning(f"Response potentially blocked due to RECITATION. Image: {image_path_for_logging}.")
+            elif finish_reason_name == "OTHER":
+                logger.warning(f"Response finished due to 'OTHER' (could be API limit, internal error). Image: {image_path_for_logging}.")
+            # Any non-STOP finish reason is treated as a failure for this annotation task
+            return None  # Mark as error
 
         # Validate content exists and has parts
         if not candidate.content or not candidate.content.parts:
-             # This case might happen if the model genuinely returns nothing *and* the API framework represents this as no parts.
-             # Let's check safety ratings again here.
-             safety_ratings_str = ", ".join([f"{sr.category.name}: {sr.probability.name}" for sr in candidate.safety_ratings]) if candidate.safety_ratings else "None"
-             logger.warning(f"Content or parts not found in Gemini response, but finish reason was STOP. Image: {image_path}. Safety Ratings: [{safety_ratings_str}]")
-             # If safety ratings are clear, assume it meant to return empty.
-             if candidate.safety_ratings and all(sr.probability == types.SafetySetting.HarmProbability.NEGLIGIBLE for sr in candidate.safety_ratings):
-                 logger.info(f"Assuming empty response means no objects found due to clear safety ratings. Image: {image_path}")
-                 return []
-             # Otherwise, it's ambiguous, treat as potential error.
-             logger.warning(f"Ambiguous empty response. Treating as failure. Image: {image_path}")
-             return None
+            # This case might happen if the model genuinely returns nothing *and* the API framework represents this as no parts.
+            # Let's check safety ratings again here.
+            safety_ratings_str = ", ".join([f"{sr.category.name}: {sr.probability.name}" for sr in candidate.safety_ratings]) if candidate.safety_ratings else "None"
+            logger.warning(f"Content or parts not found in Gemini response, but finish reason was STOP. Image: {image_path_for_logging}. Safety Ratings: [{safety_ratings_str}]")
+            # If safety ratings are clear, assume it meant to return empty.
+            if candidate.safety_ratings and all(sr.probability == types.SafetySetting.HarmProbability.NEGLIGIBLE for sr in candidate.safety_ratings):
+                logger.info(f"Assuming empty response means no objects found due to clear safety ratings. Image: {image_path_for_logging}")
+                return []
+            # Otherwise, it's ambiguous, treat as potential error.
+            logger.warning(f"Ambiguous empty response. Treating as failure. Image: {image_path_for_logging}")
+            return None
 
         # Extract text, assuming the first part contains the JSON
         # The response_mime_type='application/json' should ensure .text is the parsed JSON string
@@ -339,10 +333,10 @@ def call_gemini_api(
 
         # Handle empty string (could mean no objects found as requested)
         if not raw_text:
-             logger.info(f"Received empty text response from Gemini. Assuming no objects found. Image: {image_path}")
-             return []
+            logger.info(f"Received empty text response from Gemini. Assuming no objects found. Image: {image_path_for_logging}")
+            return []
 
-        logger.debug(f"Gemini Raw JSON Text Response ({image_path}): {raw_text}")
+        logger.debug(f"Gemini Raw JSON Text Response ({image_path_for_logging}): {raw_text}")
 
         # Parse the JSON response
         try:
@@ -351,152 +345,130 @@ def call_gemini_api(
 
             # Ensure the result is a list as requested in the prompt
             if not isinstance(annotations, list):
-                logger.warning(f"Expected JSON list from Gemini but received {type(annotations)}. Response: '{raw_text}'. Image: {image_path}")
+                logger.warning(f"Expected JSON list from Gemini but received {type(annotations)}. Response: '{raw_text}'. Image: {image_path_for_logging}")
                 # Attempt to handle if a single object dict was returned instead of a list
                 if isinstance(annotations, dict):
                     box_key = next((k for k in annotations if k.lower() == "box_2d"), None)
                     label_key = next((k for k in annotations if k.lower() == "label"), None)
                     if box_key and label_key:
-                        logger.info(f"Converting single object JSON dictionary to list. Image: {image_path}")
+                        logger.info(f"Converting single object JSON dictionary to list. Image: {image_path_for_logging}")
                         return [annotations]
                 # If it's neither a list nor a single valid object dict, treat as error
-                logger.error(f"Response is not a JSON list or a convertible single object. Image: {image_path}")
-                return None # Treat as failure
+                logger.error(f"Response is not a JSON list or a convertible single object. Image: {image_path_for_logging}")
+                return None  # Treat as failure
             return annotations
         except json.JSONDecodeError as e:
-            logger.error(f"Could not parse Gemini response as JSON. Response: '{raw_text}'. Error: {e}. Image: {image_path}")
-            return None # Treat JSON parsing error as failure
+            logger.error(f"Could not parse Gemini response as JSON. Response: '{raw_text}'. Error: {e}. Image: {image_path_for_logging}")
+            return None  # Treat JSON parsing error as failure
         except Exception as e:
             # Catch unexpected errors during JSON processing
-            logger.error(f"Unexpected error processing Gemini JSON response ({image_path}): {e}. Response: '{raw_text}'", exc_info=True)
+            logger.error(f"Unexpected error processing Gemini JSON response ({image_path_for_logging}): {e}. Response: '{raw_text}'", exc_info=True)
             return None
 
     # Handle specific API errors for retrying
     except genai_errors.APIError as e:
         # Catch other potentially retryable API errors if not covered above
-        logger.error(f"Unhandled Gemini API Error ({type(e).__name__}) for {image_path}: {e}", exc_info=False)
+        logger.error(f"Unhandled Gemini API Error ({type(e).__name__}) for {image_path_for_logging}: {e}", exc_info=False)
         # Decide if this specific APIError subclass should be retried
         if isinstance(e, RETRYABLE_EXCEPTIONS):
-             raise e # Re-raise for tenacity
+            raise e  # Re-raise for tenacity
         else:
-             logger.error(f"Treating API Error {type(e).__name__} as non-retryable for {image_path}.")
-             return None # Non-retryable API error
+            logger.error(f"Treating API Error {type(e).__name__} as non-retryable for {image_path_for_logging}.")
+            return None  # Non-retryable API error
     # Handle file not found before API call
     except FileNotFoundError:
-        logger.error(f"Image not found for API call: {image_path}")
-        return None # Non-retryable error for this specific image
+        logger.error(f"Image not found for API call: {image_path_for_logging}")
+        return None  # Non-retryable error for this specific image
     # Catch-all for other unexpected errors during the API call process
     except Exception as e:
-        logger.error(f"Unexpected error during Gemini API call preparation or execution ({image_path}): {e}", exc_info=True)
+        logger.error(f"Unexpected error during Gemini API call preparation or execution ({image_path_for_logging}): {e}", exc_info=True)
         # Only re-raise if it's a type Tenacity should retry
         if isinstance(e, RETRYABLE_EXCEPTIONS):
-             raise e # Re-raise for tenacity
-        return None # Treat as non-retryable failure for this image
+            raise e  # Re-raise for tenacity
+        return None  # Treat as non-retryable failure for this image
+
 
 # --- Main Processing Logic ---
 def process_image(
-    image_path: str,
-    output_dir: str,
-    class_list: List[str],
-    class_mapping: Dict[str, int],
-    client: genai.Client,
-    model_name: str,
-    limiter: RateLimiter
+        image_path: str,
+        output_dir: str,
+        class_list: List[str],
+        class_mapping: Dict[str, int],
+        client: genai.Client,
+        model_name: str,
+        limiter: RateLimiter
 ) -> Tuple[str, bool, Optional[str]]:
     """Processes a single image: API call (rate-limited), conversion, saving."""
     start_time = time.monotonic()
     base_filename = os.path.basename(image_path)
     logger.info(f"Processing: {base_filename}")
 
-    dimensions = get_image_dimensions(image_path)
-    if dimensions is None:
-        # Error already logged in get_image_dimensions
-        return image_path, False, "Could not get image dimensions or file is corrupt/missing."
-    img_width, img_height = dimensions
-
-    gemini_annotations = None # Initialize
     try:
-        # Pass limiter to the API call
-        gemini_annotations = call_gemini_api(client, model_name, image_path, class_list, limiter)
-    except RetryError as e:
-        # This catches errors after all retries have failed
-        logger.error(f"API call failed after all retries ({base_filename}): {e}")
-        # gemini_annotations remains None
+        original_image = Image.open(image_path).convert("RGB")
     except Exception as e:
-         # Catch unexpected errors not handled by retry or specific exceptions in call_gemini_api
-         logger.error(f"Unhandled error during API call processing for '{base_filename}': {e}", exc_info=True)
-         # gemini_annotations remains None
+        logger.error(f"Orijinal resim açılamadı ({image_path}): {e}")
+        return image_path, False, "Could not open original image."
 
-    # If API call failed, returned None (indicating an error, blocking, or invalid response)
+    # Adım 1: Resmi kareye sığdır ve padding ekle
+    padded_image = resize_and_pad_to_square(original_image, target_size=TARGET_SQUARE_SIZE)
+
+    # Adım 2: Padded resmi API'ye göndermek için byte'a çevir
+    with io.BytesIO() as output_bytes:
+        padded_image.save(output_bytes, format="JPEG", quality=95)  # Yüksek kalite gönderelim
+        image_bytes_for_api = output_bytes.getvalue()
+
+    gemini_annotations = None
+    try:
+        # Güncellenmiş API çağrısı
+        gemini_annotations = call_gemini_api(client, model_name, image_bytes_for_api, class_list, limiter, image_path)
+    except RetryError as e:
+        logger.error(f"API call failed after all retries ({base_filename}): {e}")
+
     if gemini_annotations is None:
-        return image_path, False, "Gemini API call failed, returned invalid/empty response, was blocked, or timed out after retries."
+        return image_path, False, "Gemini API call failed or returned invalid data."
 
-    # Prepare output path
-    annotation_filename = os.path.splitext(base_filename)[0] + ".txt"
+    # Adım 3: Etiketleri ve YENİ resmi kaydetmek için yolları hazırla
+    base_name_no_ext = os.path.splitext(base_filename)[0]
+    annotation_filename = f"{base_name_no_ext}.txt"
+    output_image_filename = f"{base_name_no_ext}.jpg"  # Çıktıyı standart olarak .jpg yapalım
+
     annotation_path = os.path.join(output_dir, annotation_filename)
+    output_image_path = os.path.join(output_dir, output_image_filename)
 
-    # Handle case where API returned an empty list (no objects found)
-    if not gemini_annotations: # Checks for empty list explicitly
-        logger.info(f"No objects from the specified classes found in '{base_filename}' (API returned empty list).")
-        try:
-            os.makedirs(output_dir, exist_ok=True)
-            # Create an empty file to indicate processing was successful but no objects were found
-            with open(annotation_path, "w", encoding='utf-8') as f:
-                pass # Write nothing
-            logger.info(f"Empty annotation file created: {annotation_filename}")
-            processing_time = time.monotonic() - start_time
-            return image_path, True, f"No objects found, empty file created ({processing_time:.2f}s)"
-        except IOError as e:
-            logger.error(f"Could not write empty annotation file '{annotation_path}': {e}")
-            return image_path, False, "Could not write empty annotation file."
-
-    # Convert valid Gemini annotations to YOLO format
+    # Adım 4: Basitleştirilmiş fonksiyon ile YOLO'ya dönüştür
     yolo_lines = convert_gemini_to_yolo(gemini_annotations, class_mapping, image_path)
 
-    # Handle case where conversion resulted in no valid lines (e.g., all labels unknown, invalid boxes post-conversion)
-    if not yolo_lines:
-        logger.warning(f"Could not generate valid YOLO annotations for '{base_filename}' (post-conversion). Gemini response was: {gemini_annotations}")
-        # Decide whether to create an empty file or mark as failure. Let's create empty for consistency.
-        try:
-            os.makedirs(output_dir, exist_ok=True)
-            with open(annotation_path, "w", encoding='utf-8') as f:
-                pass # Write nothing
-            logger.info(f"Empty annotation file created (no valid objects post-conversion): {annotation_filename}")
-            processing_time = time.monotonic() - start_time
-            return image_path, True, f"No objects post-conversion, empty file created ({processing_time:.2f}s)"
-        except IOError as e:
-            logger.error(f"Could not write empty annotation file ({annotation_path}) post-conversion: {e}")
-            return image_path, False, "Could not write empty annotation file (post-conversion)."
-
-
-    # Save the valid YOLO annotations
+    # Adım 5: Hem etiketi hem de yeni, kare resmi kaydet
     try:
         os.makedirs(output_dir, exist_ok=True)
-        with open(annotation_path, "w", encoding='utf-8') as f:
-            for line in yolo_lines:
-                f.write(line + "\n")
-        processing_time = time.monotonic() - start_time
-        logger.info(f"Annotated ({len(yolo_lines)} objects): {annotation_filename} ({processing_time:.2f}s)")
-        return image_path, True, f"{len(yolo_lines)} objects annotated ({processing_time:.2f}s)"
 
-    except IOError as e:
-        logger.error(f"Could not write annotation file '{annotation_path}': {e}")
-        return image_path, False, "Could not write annotation file."
+        # Etiket dosyasını yaz
+        with open(annotation_path, "w", encoding='utf-8') as f:
+            if yolo_lines:
+                f.write("\n".join(yolo_lines) + "\n")
+
+        # Yeni, kare resmi yaz (YOLO eğitimi için)
+        padded_image.save(output_image_path, format="JPEG", quality=90)  # Kaydederken kaliteyi biraz düşürebiliriz
+
+        processing_time = time.monotonic() - start_time
+        message = f"{len(yolo_lines) if yolo_lines else 'No'} objects annotated ({processing_time:.2f}s)"
+        logger.info(f"Success ({base_filename}): {message}")
+        return image_path, True, message
+
     except Exception as e:
-        # Catch any other unexpected error during file writing
-        logger.error(f"Unexpected error while saving annotation file '{annotation_path}': {e}", exc_info=True)
-        return image_path, False, "Error occurred while saving annotation file."
+        logger.error(f"Could not write output files for '{base_filename}': {e}")
+        return image_path, False, "Could not write output files."
 
 
 def process_dataset(
-    image_dir: str,
-    output_dir: str,
-    class_list_path: str,
-    api_key: str,
-    model_name: str,
-    max_workers: int,
-    rpm_limit: int = API_RPM_LIMIT,
-    resume: bool = False # <-- Added resume parameter
+        image_dir: str,
+        output_dir: str,
+        class_list_path: str,
+        api_key: str,
+        model_name: str,
+        max_workers: int,
+        rpm_limit: int = API_RPM_LIMIT,
+        resume: bool = False  # <-- Added resume parameter
 ):
     """Processes images in the dataset in parallel (rate-limited), optionally resuming."""
     logger.info(f"Dataset processing started: {image_dir}")
@@ -504,14 +476,13 @@ def process_dataset(
     logger.info(f"Model to use: {model_name}")
     logger.info(f"Maximum workers: {max_workers}")
     logger.info(f"API Request Limit: {rpm_limit} RPM")
-    logger.info(f"Resume mode: {'Enabled' if resume else 'Disabled'}") # <-- Log resume status
+    logger.info(f"Resume mode: {'Enabled' if resume else 'Disabled'}")  # <-- Log resume status
 
     if not os.path.isdir(image_dir):
         logger.error(f"Image directory not found or is not a directory: {image_dir}")
         return
 
     os.makedirs(output_dir, exist_ok=True)
-
 
     try:
         class_list = load_class_list(class_list_path)
@@ -534,7 +505,7 @@ def process_dataset(
     # --- /Rate Limiter Creation ---
 
     # Find all supported image files initially
-    all_image_files = sorted([ # Sort for potentially more consistent processing order
+    all_image_files = sorted([  # Sort for potentially more consistent processing order
         os.path.join(image_dir, f)
         for f in os.listdir(image_dir)
         if os.path.isfile(os.path.join(image_dir, f)) and f.lower().endswith(SUPPORTED_IMAGE_FORMATS)
@@ -549,20 +520,21 @@ def process_dataset(
     skipped_count = 0
     if resume:
         logger.info("Resume mode enabled. Checking for existing annotation files...")
-        existing_annotations = set(os.listdir(output_dir)) # Get existing files in output dir
+        output_path = pathlib.Path(output_dir)
+        existing_stems = {p.stem for p in output_path.glob('**/*.txt')}
+
         for img_path in all_image_files:
-            base_filename = os.path.basename(img_path)
-            annotation_filename = os.path.splitext(base_filename)[0] + ".txt"
-            # Check if the corresponding .txt file exists in the output directory
-            if annotation_filename in existing_annotations:
-                logger.debug(f"Skipping '{base_filename}': Annotation file '{annotation_filename}' already exists.")
+            # Orijinal resim dosyasının da uzantısız adını alıp karşılaştırırız.
+            image_stem = pathlib.Path(img_path).stem
+            if image_stem in existing_stems:
+                logger.debug(f"Skipping '{os.path.basename(img_path)}': Annotation for stem '{image_stem}' already exists.")
                 skipped_count += 1
             else:
                 images_to_process.append(img_path)
         logger.info(f"Found {skipped_count} existing annotation files. Will attempt to process {len(images_to_process)} remaining images.")
     else:
         logger.info("Resume mode disabled. Processing all found images.")
-        images_to_process = all_image_files # Process all images if not resuming
+        images_to_process = all_image_files
 
     # --- End of filtering ---
 
@@ -571,8 +543,8 @@ def process_dataset(
             logger.info(f"No images left to process in resume mode (all {len(all_image_files)} images already have annotations or initial list was empty).")
         else:
             # This case should have been caught earlier if all_image_files was empty
-             logger.warning(f"No images selected for processing. This might be unexpected if resume mode was off.")
-        return # Exit if nothing to process
+            logger.warning(f"No images selected for processing. This might be unexpected if resume mode was off.")
+        return  # Exit if nothing to process
 
     total_to_process = len(images_to_process)
     logger.info(f"Total {total_to_process} images selected for processing.")
@@ -587,7 +559,7 @@ def process_dataset(
         # Submit only the filtered list of images
         futures = {
             executor.submit(process_image, img_path, output_dir, class_list, class_mapping, client, model_name, limiter): img_path
-            for img_path in images_to_process # <-- Use the filtered list
+            for img_path in images_to_process  # <-- Use the filtered list
         }
 
         # Process results as they complete
@@ -609,12 +581,12 @@ def process_dataset(
 
                 # Log progress periodically
                 if processed_count % 20 == 0 or processed_count == total_to_process:
-                     elapsed_time = time.monotonic() - start_time_total
-                     rate = processed_count / elapsed_time if elapsed_time > 0 else 0
-                     logger.info(
-                         f"Progress: {processed_count}/{total_to_process} [{success_count}✓, {failed_count}✗] "
-                         f"({elapsed_time:.1f}s, {rate:.2f} img/s)"
-                     )
+                    elapsed_time = time.monotonic() - start_time_total
+                    rate = processed_count / elapsed_time if elapsed_time > 0 else 0
+                    logger.info(
+                        f"Progress: {processed_count}/{total_to_process} [{success_count}✓, {failed_count}✗] "
+                        f"({elapsed_time:.1f}s, {rate:.2f} img/s)"
+                    )
 
             except Exception as exc:
                 # Catch errors that might occur retrieving the result itself (less likely now with better error handling in process_image)
@@ -632,8 +604,9 @@ def process_dataset(
     logger.info(f"Successful Annotations: {success_count}")
     logger.info(f"Failed Annotations: {failed_count}")
     logger.info(f"Total Processing Duration: {total_duration:.2f} seconds")
-    if processed_count > 0 : logger.info(f"Average Time/Processed Image: {total_duration / processed_count:.2f} seconds")
+    if processed_count > 0: logger.info(f"Average Time/Processed Image: {total_duration / processed_count:.2f} seconds")
     logger.info("-" * 40)
+
 
 # --- Argument Parser and Main Execution Block ---
 def main():
@@ -650,7 +623,7 @@ def main():
     parser.add_argument("--model_name", help="Gemini model to use.", default=DEFAULT_GEMINI_MODEL)
     parser.add_argument("--max_workers", type=int, help="Maximum number of worker threads for parallel processing.", default=DEFAULT_MAX_WORKERS)
     parser.add_argument("--rpm", type=int, help="Maximum API requests per minute limit.", default=API_RPM_LIMIT)
-    parser.add_argument("--resume", action="store_true", help="Enable resume mode: skip images with existing annotation files in the output directory.") # <-- Resume argument
+    parser.add_argument("--resume", action="store_true", help="Enable resume mode: skip images with existing annotation files in the output directory.")  # <-- Resume argument
     parser.add_argument("--log_level", choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'], default='INFO', help="Logging level to set.")
 
     args = parser.parse_args()
@@ -662,12 +635,11 @@ def main():
     for handler in logger.handlers:
         handler.setLevel(log_level_int)
 
-
     # Get API key from argument or environment variable
     api_key = os.environ.get("GOOGLE_API_KEY")
     if not api_key:
         logger.critical("Google Gemini API key was not provided either via --api_key argument or GOOGLE_API_KEY environment variable. Stopping.")
-        return 1 # Indicate error
+        return 1  # Indicate error
 
     # Pass RPM limit and resume flag to process_dataset
     process_dataset(
@@ -678,9 +650,10 @@ def main():
         model_name=args.model_name,
         max_workers=args.max_workers,
         rpm_limit=args.rpm,
-        resume=args.resume # <-- Pass resume flag
+        resume=args.resume  # <-- Pass resume flag
     )
-    return 0 # Indicate success
+    return 0  # Indicate success
+
 
 # --- Script Execution (Example) ---
 # The following section is for direct execution, taking arguments from here.
@@ -688,19 +661,18 @@ def main():
 
 # Example Usage (For direct execution - instead of command line)
 # Set these variables according to your setup
-RUN_DIRECTLY = True # Set to False to use command-line arguments instead
-MODEL_NAME='gemini-2.0-flash' # <-- Model name (e.g., 1.5-flash or higher)
-MAX_WORKERS=4 # <-- Number of workers (mind the RPM limit!)
-RPM_LIMIT_VALUE = 15# <-- Requests per minute limit (e.g., 15 for Free Tier)
-RESUME_PROCESSING = True # <-- Set to True to enable resume mode when running directly
-LOG_LEVEL_DIRECT = logging.INFO # <-- Set desired log level (e.g., logging.DEBUG)
-
+RUN_DIRECTLY = True  # Set to False to use command-line arguments instead
+MODEL_NAME = 'gemini-2.0-flash'  # <-- Model name (e.g., 1.5-flash or higher)
+MAX_WORKERS = 40  # <-- Number of workers (mind the RPM limit!)
+RPM_LIMIT_VALUE = 1500  # <-- Requests per minute limit (e.g., 15 for Free Tier)
+RESUME_PROCESSING = True  # <-- Set to True to enable resume mode when running directly
+LOG_LEVEL_DIRECT = logging.INFO  # <-- Set desired log level (e.g., logging.DEBUG)
 
 # --------------------------- Direct‑run defaults -----------------------------
-IMAGE_DIR        = "images"
-OUTPUT_DIR       = "output"
-CLASS_LIST_PATH  = "class_list.txt"
-RESUME           = True
+IMAGE_DIR = "Havayolu_Veriseti"
+OUTPUT_DIR = "Havayolu_Veriseti_Output"
+CLASS_LIST_PATH = "class_list.txt"
+RESUME = True
 # 💡 NEW: explicit three-way split ratios (must sum to 1)
 TRAIN_RATIO      = 0.7
 VAL_RATIO        = 0.2
@@ -711,6 +683,7 @@ TEST_RATIO       = 0.1
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
     import random, shutil, pathlib, sys, os, textwrap
+
 
     # -------------------- helper: write data.yaml --------------------
     def write_data_yaml(output_dir: str, class_list: list[str]):
@@ -740,98 +713,74 @@ if __name__ == "__main__":
         except Exception as e:
             logger.error("Could not write data.yaml: %s", e)
 
+
     # ---------------------- helper: split_dataset --------------------
     def split_dataset(
-        image_dir: str,
-        output_dir: str,
-        train_ratio: float = 0.7,
-        val_ratio: float = 0.2,
-        test_ratio: float = 0.1,
+            source_dir: str,  # <-- Artık kaynak olarak output_dir'i alacak
+            train_ratio: float = 0.7,
+            val_ratio: float = 0.2,
+            test_ratio: float = 0.1,
     ):
-        """Move image/label pairs into train/ val/ test/ folders."""
+        """
+        Artık hem resimleri hem de etiketleri AYNI kaynak klasörden alır ve böler.
+        """
+        logger.info(f"Splitting dataset from source: {source_dir}")
         if not abs((train_ratio + val_ratio + test_ratio) - 1.0) < 1e-6:
             raise ValueError("Split ratios must sum to 1.0")
-        SUPPORTED_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
-        lbl_files = [p for p in pathlib.Path(output_dir).iterdir() if p.suffix == ".txt"]
+
+        source_path = pathlib.Path(source_dir)
+        # .txt dosyalarını bul, çünkü her resmin bir etiketi olmayabilir ama her etiketin bir resmi olmalı
+        lbl_files = list(source_path.glob("*.txt"))
         if not lbl_files:
-            logger.warning("No annotation files found for splitting – skipping.")
+            logger.warning("No annotation files found in output directory for splitting. Skipping.")
             return
-        pairs = []
-        for lbl in lbl_files:
-            stem = lbl.stem
-            img = next(
-                (
-                    pathlib.Path(image_dir) / f"{stem}{ext}"
-                    for ext in SUPPORTED_EXTS
-                    if (pathlib.Path(image_dir) / f"{stem}{ext}").exists()
-                ),
-                None,
-            )
-            if img:
-                pairs.append((img, lbl))
-            else:
-                logger.warning("Image for %s not found; skipping pair.", lbl.name)
-        if not pairs:
-            logger.warning("No image/label pairs to move – aborting split.")
-            return
+
+        stems = sorted([p.stem for p in lbl_files])
         random.seed(42)
-        random.shuffle(pairs)
-        n = len(pairs)
+        random.shuffle(stems)
+
+        n = len(stems)
         n_train = int(n * train_ratio)
-        n_val   = int(n * val_ratio)
-        train_pairs = pairs[:n_train]
-        val_pairs   = pairs[n_train:n_train + n_val]
-        test_pairs  = pairs[n_train + n_val:]
+        n_val = int(n * val_ratio)
 
-        def _d(p):
-            p.mkdir(parents=True, exist_ok=True)
-            return p
-
-        dirs = {
-            "train_img": _d(pathlib.Path(output_dir) / "train" / "images"),
-            "train_lbl": _d(pathlib.Path(output_dir) / "train" / "labels"),
-            "val_img":   _d(pathlib.Path(output_dir) / "val" / "images"),
-            "val_lbl":   _d(pathlib.Path(output_dir) / "val" / "labels"),
-            "test_img":  _d(pathlib.Path(output_dir) / "test" / "images"),
-            "test_lbl":  _d(pathlib.Path(output_dir) / "test" / "labels"),
+        splits = {
+            'train': stems[:n_train],
+            'val': stems[n_train:n_train + n_val],
+            'test': stems[n_train + n_val:]
         }
 
-        def _mv(src: pathlib.Path, dst_dir: pathlib.Path):
-            dst = dst_dir / src.name
-            if dst.exists():
-                return
-            try:
-                shutil.move(str(src), str(dst))
-            except Exception as e:
-                logger.error("Move failed %s → %s: %s", src, dst, e)
+        for split_name, file_stems in splits.items():
+            if not file_stems: continue
 
-        for img, lbl in train_pairs:
-            _mv(img, dirs["train_img"])
-            _mv(lbl, dirs["train_lbl"])
-        for img, lbl in val_pairs:
-            _mv(img, dirs["val_img"])
-            _mv(lbl, dirs["val_lbl"])
-        for img, lbl in test_pairs:
-            _mv(img, dirs["test_img"])
-            _mv(lbl, dirs["test_lbl"])
+            # Hedef klasörleri oluştur
+            img_dir_dst = source_path / split_name / 'images'
+            lbl_dir_dst = source_path / split_name / 'labels'
+            img_dir_dst.mkdir(parents=True, exist_ok=True)
+            lbl_dir_dst.mkdir(parents=True, exist_ok=True)
 
-        logger.info(
-            "Split complete – train %d, val %d, test %d (ratios %.2f/%.2f/%.2f)",
-            len(train_pairs), len(val_pairs), len(test_pairs),
-            train_ratio, val_ratio, test_ratio,
-        )
-        # Write YAML
+            for stem in file_stems:
+                # Hem .jpg hem de .txt dosyasını taşı
+                shutil.move(str(source_path / f"{stem}.jpg"), str(img_dir_dst / f"{stem}.jpg"))
+                shutil.move(str(source_path / f"{stem}.txt"), str(lbl_dir_dst / f"{stem}.txt"))
+
+        logger.info(f"Split complete – train {len(splits['train'])}, val {len(splits['val'])}, test {len(splits['test'])}")
+
         try:
+            # CLASS_LIST_PATH'in global olarak erişilebilir olduğunu varsayıyoruz
             with open(CLASS_LIST_PATH, "r", encoding="utf-8") as fh:
                 cls_names = [ln.strip() for ln in fh if ln.strip()]
-            write_data_yaml(output_dir, cls_names)
+            # data.yaml dosyasını ana çıktı klasörüne yaz
+            write_data_yaml(source_dir, cls_names)
         except Exception as e:
-            logger.error("Unable to read classes for data.yaml: %s", e)
+            logger.error(f"Unable to read classes for data.yaml: {e}")
 
-    def post_split(img_dir: str, out_dir: str):
+
+    def post_split(out_dir: str):
         logger.info("🏁 Annotation phase finished – starting dataset split …")
-        split_dataset(img_dir, out_dir, TRAIN_RATIO, VAL_RATIO, TEST_RATIO)
+        # Artık hem resimlerin hem de etiketlerin kaynağı OUTPUT_DIR
+        split_dataset(out_dir, TRAIN_RATIO, VAL_RATIO, TEST_RATIO)
         logger.info("✅ Split completed.")
+
 
     # ------------------- Choose CLI vs direct defaults -----------------
     if len(sys.argv) > 1:
@@ -839,7 +788,7 @@ if __name__ == "__main__":
         if code == 0:
             img_dir = os.environ.get("IMAGE_DIR", IMAGE_DIR)
             out_dir = os.environ.get("OUTPUT_DIR", OUTPUT_DIR)
-            post_split(img_dir, out_dir)
+            post_split(out_dir)
         sys.exit(code)
 
     logger.info("No CLI args – using internal defaults.")
@@ -858,9 +807,8 @@ if __name__ == "__main__":
             rpm_limit=RPM_LIMIT_VALUE,
             resume=RESUME,
         )
-        post_split(IMAGE_DIR, OUTPUT_DIR)
+        post_split(OUTPUT_DIR)
         sys.exit(0)
     except Exception as e:
         logger.error("Fatal error: %s", e)
         sys.exit(2)
-
