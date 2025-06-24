@@ -37,7 +37,7 @@ DEFAULT_MAX_WORKERS = 4
 RETRY_ATTEMPTS = 3
 RETRY_WAIT_MULTIPLIER = 10
 RETRY_WAIT_MAX = 40
-API_RPM_LIMIT = 1500  # Requests per minute limit (adjust based on your tier)
+API_RPM_LIMIT = 15  # Requests per minute limit (adjust based on your tier)
 API_REQUEST_PERIOD = 60  # seconds (1 minute)
 TARGET_SQUARE_SIZE = (1280, 1280)
 
